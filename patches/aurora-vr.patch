@@ -13,10 +13,10 @@ index dfeed19..277adf8 100644
  
 diff --git a/include/aurora/xr.hpp b/include/aurora/xr.hpp
 new file mode 100644
-index 0000000..0fd91c9
+index 0000000..bfc0e52
 --- /dev/null
 +++ b/include/aurora/xr.hpp
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,55 @@
 +#pragma once
 +
 +#include <webgpu/webgpu_cpp.h>
@@ -34,6 +34,10 @@ index 0000000..0fd91c9
 +  wgpu::TextureFormat format;
 +  uint32_t width;
 +  uint32_t height;
++  // The UI overlay (menus) drawn this frame, if any: window-sized, premultiplied alpha when
++  // uiOverlay, otherwise opaque (it already contains the scene behind it).
++  wgpu::TextureView ui;
++  bool uiOverlay = false;
 +};
 +
 +using AfterSubmitCallback = std::function<void()>;
@@ -69,7 +73,7 @@ index 0000000..0fd91c9
 +
 +} // namespace aurora::xr
 diff --git a/lib/aurora.cpp b/lib/aurora.cpp
-index 9430842..760dd38 100644
+index 9430842..6008749 100644
 --- a/lib/aurora.cpp
 +++ b/lib/aurora.cpp
 @@ -25,6 +25,8 @@
@@ -94,7 +98,7 @@ index 9430842..760dd38 100644
  AuroraConfig g_config;
  uint32_t g_sdlCustomEventsStart;
  char g_gameName[4];
-@@ -271,9 +279,15 @@ void end_frame() noexcept {
+@@ -271,29 +279,53 @@ void end_frame() noexcept {
    auto imguiDrawData = imgui::freeze();
  
    const auto& presentSource = webgpu::present_source();
@@ -112,12 +116,22 @@ index 9430842..760dd38 100644
 +  }
  
    wgpu::BindGroup rmlBindGroup;
++  wgpu::TextureView rmlView;
    bool rmlOverlay = false;
-@@ -286,14 +300,26 @@ void end_frame() noexcept {
+ #if AURORA_ENABLE_RMLUI
+   if (rmlui::is_initialized()) {
+     auto rmlFrame = rmlui::record_frame(viewport);
+     rmlBindGroup = std::move(rmlFrame.bindGroup);
+     rmlOverlay = rmlFrame.overlay;
++    if (rmlBindGroup) {
++      rmlView = std::move(rmlFrame.view);
++    }
+   }
  #endif
  
-   gfx::end_frame([rmlBindGroup = std::move(rmlBindGroup), rmlOverlay, viewport,
+-  gfx::end_frame([rmlBindGroup = std::move(rmlBindGroup), rmlOverlay, viewport,
 -                  imguiDrawData = std::move(imguiDrawData)](
++  gfx::end_frame([rmlBindGroup = std::move(rmlBindGroup), rmlView = std::move(rmlView), rmlOverlay, viewport,
 +                  imguiDrawData = std::move(imguiDrawData), xrHook = xr::detail::take_frame_hook(),
 +                  windowPresent = xr::detail::take_window_present()](
                       wgpu::CommandEncoder& encoder, std::vector<gfx::AfterSubmitCallback> afterSubmitCallbacks) {
@@ -129,6 +143,8 @@ index 9430842..760dd38 100644
 +          .format = source.format,
 +          .width = source.size.width,
 +          .height = source.size.height,
++          .ui = rmlView,
++          .uiOverlay = rmlOverlay,
 +      };
 +      xrHook(encoder, xrSource, afterSubmitCallbacks);
 +    }
@@ -142,7 +158,7 @@ index 9430842..760dd38 100644
          ZoneScopedN("Acquire texture");
          wgpu::SurfaceTexture surfaceTexture;
          g_surface.GetCurrentTexture(&surfaceTexture);
-@@ -363,7 +389,7 @@ void end_frame() noexcept {
+@@ -363,7 +395,7 @@ void end_frame() noexcept {
          imgui::render(pass, imguiDrawData);
          pass.End();
        }
@@ -151,7 +167,7 @@ index 9430842..760dd38 100644
        Log.info("Skipping present; window not presentable");
      }
      webgpu::gpu_prof::frame_end(encoder);
-@@ -389,7 +415,7 @@ void end_frame() noexcept {
+@@ -389,7 +421,7 @@ void end_frame() noexcept {
          Log.warn("Surface present failed");
          webgpu::release_surface();
        }
@@ -160,6 +176,30 @@ index 9430842..760dd38 100644
        switch (surfaceStatus) {
        case wgpu::SurfaceGetCurrentTextureStatus::Timeout:
          Log.warn("Surface texture acquisition timed out");
+diff --git a/lib/rmlui.cpp b/lib/rmlui.cpp
+index c82409d..ea5fbef 100644
+--- a/lib/rmlui.cpp
++++ b/lib/rmlui.cpp
+@@ -481,6 +481,7 @@ RecordedFrame record_frame(const webgpu::Viewport& presentViewport) noexcept {
+   return {
+       .bindGroup = s_renderTargetCopyBindGroup,
+       .overlay = !needsBackdrop,
++      .view = s_renderTarget.view,
+   };
+ }
+ 
+diff --git a/lib/rmlui.hpp b/lib/rmlui.hpp
+index 787bb2d..a28abf2 100644
+--- a/lib/rmlui.hpp
++++ b/lib/rmlui.hpp
+@@ -12,6 +12,7 @@ namespace aurora::rmlui {
+ struct RecordedFrame {
+   wgpu::BindGroup bindGroup;
+   bool overlay = false;
++  wgpu::TextureView view; // the UI as drawn this frame (premultiplied when overlay)
+ };
+ 
+ void initialize(const AuroraWindowSize& size) noexcept;
 diff --git a/lib/webgpu/gpu.cpp b/lib/webgpu/gpu.cpp
 index b3ae6cd..0a0ff03 100644
 --- a/lib/webgpu/gpu.cpp

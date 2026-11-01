@@ -3,6 +3,7 @@
 #include "dusk/interp/frame_interpolation.h"
 #include "dusk/logging.h"
 #include "dusk/menu_pointer.h"
+#include "dusk/ui/ui.hpp"
 #include "dusk/settings.h"
 #include "dusk/config.hpp"
 #include "dusk/vr/vr_input.h"
@@ -20,6 +21,8 @@
 
 #include <aurora/aurora.h>
 #include <aurora/rmlui.hpp>
+#include <RmlUi/Core/Context.h>
+#include <RmlUi/Core/Input.h>
 #include <aurora/gfx.h>
 #include <aurora/xr.hpp>
 #include <imgui.h>
@@ -344,15 +347,17 @@ void update_hud_pose(float dt, bool paused) {
     xr::set_hud_pose(pose, g_hudWidth, g_hudHeight);
 }
 
-// In menus, the sword hand is a laser pointer onto the HUD panel; the trigger clicks.
+// In menus, the sword hand is a laser pointer onto the HUD panel; the trigger clicks. Dusklight's
+// own menus (launcher, settings, mods) get mouse input; the game's menus get the menu pointer.
 void update_pointer() {
     const auto& in = xr::input();
     const xr::Hand handIdx = input::sword_hand();
     const auto& hand = in.hands[handIdx];
+    const bool dusklightMenu = ui::any_document_visible();
     bool onPanel = false;
     float u = 0.f, v = 0.f;
     Pose hit;
-    if (menu_pointer::enabled() && menu_pointer::active() && hand.active) {
+    if ((dusklightMenu || (menu_pointer::enabled() && menu_pointer::active())) && hand.active) {
         const Vec3 origin = hand.aim.position;
         const Vec3 dir = hand.aim.forward();
         const Vec3 normal = g_hudPose.orientation.rotate({0.f, 0.f, 1.f});
@@ -374,8 +379,15 @@ void update_pointer() {
     auto* context = aurora::rmlui::get_context();
     if (!onPanel || context == nullptr) {
         if (g_pointerDown) {
-            menu_pointer::handle_fallthrough_pointer(0.f, 0.f, menu_pointer::Phase::Cancel, true);
+            if (dusklightMenu && context != nullptr) {
+                context->ProcessMouseButtonUp(0, 0);
+            } else {
+                menu_pointer::handle_fallthrough_pointer(0.f, 0.f, menu_pointer::Phase::Cancel, true);
+            }
             g_pointerDown = false;
+        }
+        if (dusklightMenu && g_pointerOnPanel && context != nullptr) {
+            context->ProcessMouseLeave();
         }
         g_pointerOnPanel = false;
         input::set_pointer_captured(false);
@@ -388,6 +400,20 @@ void update_pointer() {
     const float x = u * static_cast<float>(dims.x);
     const float y = v * static_cast<float>(dims.y);
     const bool trigger = in.trigger[handIdx] > 0.6f;
+    if (dusklightMenu) {
+        context->ProcessMouseMove(static_cast<int>(x), static_cast<int>(y), 0);
+        if (trigger && !g_pointerDown) {
+            context->ProcessMouseButtonDown(0, 0);
+            xr::haptic(handIdx, 0.3f, 0.02f);
+        } else if (!trigger && g_pointerDown) {
+            context->ProcessMouseButtonUp(0, 0);
+        }
+        g_pointerDown = trigger;
+        g_pointerOnPanel = true;
+        input::set_pointer_captured(true);
+        xr::set_cursor(true, hit, 0.02f * g_hudWidth / 1.5f);
+        return;
+    }
     menu_pointer::Phase phase = menu_pointer::Phase::Move;
     if (trigger && !g_pointerDown) {
         phase = menu_pointer::Phase::Press;
@@ -400,6 +426,78 @@ void update_pointer() {
     g_pointerOnPanel = true;
     input::set_pointer_captured(true);
     xr::set_cursor(true, hit, 0.02f * g_hudWidth / 1.5f);
+}
+
+// Controller buttons and sticks for Dusklight's own menus, as the keys its gamepad support sends:
+// stick = arrows, A = confirm, B = back, grips = previous/next tab, Menu = close.
+void update_menu_keys(float dt, bool openMenu) {
+    auto* context = aurora::rmlui::get_context();
+    if (context == nullptr) {
+        return;
+    }
+    const auto tap = [&](Rml::Input::KeyIdentifier key) {
+        context->ProcessKeyDown(key, 0);
+        context->ProcessKeyUp(key, 0);
+    };
+    if (openMenu) {
+        tap(Rml::Input::KI_F1);
+    }
+    static xr::InputState prev;
+    static Rml::Input::KeyIdentifier heldDir = Rml::Input::KI_UNKNOWN;
+    static float repeatTimer = 0.f;
+    const auto& in = xr::input();
+    if (!ui::any_document_visible()) {
+        prev = in;
+        heldDir = Rml::Input::KI_UNKNOWN;
+        return;
+    }
+    const auto pressed = [&](bool now, bool before) { return now && !before; };
+    for (int h = 0; h < 2; ++h) {
+        if (pressed(in.buttonLower[h], prev.buttonLower[h])) {
+            tap(Rml::Input::KI_RETURN);
+        }
+        if (pressed(in.buttonUpper[h], prev.buttonUpper[h])) {
+            tap(Rml::Input::KI_ESCAPE);
+        }
+    }
+    if (pressed(in.squeeze[xr::kLeft] > 0.6f, prev.squeeze[xr::kLeft] > 0.6f)) {
+        tap(Rml::Input::KI_PRIOR);
+    }
+    if (pressed(in.squeeze[xr::kRight] > 0.6f, prev.squeeze[xr::kRight] > 0.6f)) {
+        tap(Rml::Input::KI_NEXT);
+    }
+    if (pressed(in.menu, prev.menu) && !openMenu) {
+        tap(Rml::Input::KI_F1);
+    }
+
+    // Stick: the stronger of the two, with key repeat.
+    float sx = 0.f, sy = 0.f;
+    for (int h = 0; h < 2; ++h) {
+        if (std::hypot(in.stickX[h], in.stickY[h]) > std::hypot(sx, sy)) {
+            sx = in.stickX[h];
+            sy = in.stickY[h];
+        }
+    }
+    Rml::Input::KeyIdentifier dir = Rml::Input::KI_UNKNOWN;
+    if (std::fabs(sy) > 0.6f && std::fabs(sy) >= std::fabs(sx)) {
+        dir = sy > 0.f ? Rml::Input::KI_UP : Rml::Input::KI_DOWN;
+    } else if (std::fabs(sx) > 0.6f) {
+        dir = sx > 0.f ? Rml::Input::KI_RIGHT : Rml::Input::KI_LEFT;
+    }
+    if (dir != heldDir) {
+        heldDir = dir;
+        repeatTimer = 0.4f;
+        if (dir != Rml::Input::KI_UNKNOWN) {
+            tap(dir);
+        }
+    } else if (dir != Rml::Input::KI_UNKNOWN) {
+        repeatTimer -= dt;
+        if (repeatTimer <= 0.f) {
+            tap(dir);
+            repeatTimer = 0.12f;
+        }
+    }
+    prev = in;
 }
 
 }  // namespace
@@ -508,10 +606,11 @@ bool begin_frame() {
         recenter();
     }
 
-    update_hud_pose(dt, dMeter2Info_getPauseStatus() != 0);
+    update_hud_pose(dt, dMeter2Info_getPauseStatus() != 0 || ui::any_document_visible());
     update_pointer();
 
     const auto result = input::update_frame(xr::input(), xr::head(), dt, g_ctx);
+    update_menu_keys(dt, result.openDusklightMenu);
     turn(result.turnRad);
     {
         static float vignette = 0.f;

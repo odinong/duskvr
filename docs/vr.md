@@ -47,7 +47,8 @@ The sword hand is the right controller by default (Settings: left handed).
 | Sword-hand A / B | A (action) / Z (Midna) |
 | Off-hand X / Y | X / Y items |
 | Off-hand trigger / grip | L (lock on) / R |
-| Menu | Start |
+| Menu (tap) | Start (pause / collection) |
+| Menu (hold) | Dusklight's own menu |
 
 | Wolf: swipe a controller / lunge your head forward | Claw / bite (B) |
 | Wolf: both hands low, scrabbling | Dig (A) |
@@ -132,6 +133,12 @@ blade points along the controller like a held sword. Everything held is moved to
 pose again at draw time, so hands track at the headset's refresh rate rather than the game's 30 Hz.
 If a weapon sits at an odd angle in your grip, the sword / shield pitch, yaw and roll offsets in
 Tools > VR adjust it.
+
+### Dusklight's menus
+
+The launcher, settings, mod manager and other Dusklight windows appear on the floating panel too,
+live every frame. Point and pull the sword-hand trigger to click, or use either stick to move,
+A to confirm, B to go back, the grips to switch tabs and Menu to close.
 
 ### HUD panel
 

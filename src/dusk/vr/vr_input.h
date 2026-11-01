@@ -9,6 +9,7 @@ struct FrameResult {
     float motion = 0.f;     // 0..1, how much artificial movement is happening (comfort vignette)
     bool recenter = false;
     bool toggleView = false;
+    bool openDusklightMenu = false;  // Menu held
 };
 
 struct Context {

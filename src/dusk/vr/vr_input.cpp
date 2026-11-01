@@ -38,6 +38,7 @@ struct Latched {
     bool dig = false;   // wolf: A
     bool spur = false;  // horse: A
     bool toss = false;  // carrying: A throws
+    bool start = false; // Menu tapped
 };
 
 Latched g_latched;
@@ -64,6 +65,8 @@ float g_lungeCooldown = 0.f;
 float g_digCooldown = 0.f;
 float g_spurCooldown = 0.f;
 float g_tossCooldown = 0.f;
+float g_menuHeld = 0.f;
+constexpr float kMenuHold = 0.7f;
 bool g_climbActive = false;
 float g_climbX = 0.f, g_climbY = 0.f;
 float g_swimDrive = 0.f;
@@ -398,6 +401,20 @@ FrameResult update_frame(const xr::InputState& in, const Pose& head, float dt, c
     }
     g_prevStickClick = in.stickClick[s];
 
+    // Menu: a tap is the game's Start (on release), holding it opens Dusklight's own menu.
+    if (in.menu) {
+        g_menuHeld += dt;
+        if (g_menuHeld >= kMenuHold && g_menuHeld - dt < kMenuHold) {
+            result.openDusklightMenu = true;
+            xr::haptic(shield_hand(), 0.4f, 0.05f);
+        }
+    } else {
+        if (g_menuHeld > 0.f && g_menuHeld < kMenuHold) {
+            g_latched.start = true;
+        }
+        g_menuHeld = 0.f;
+    }
+
     update_hand_velocities(in, dt);
     if (ctx.gameplay && getSettings().vr.motionControls) {
         update_bow(in, dt, ctx);
@@ -477,7 +494,7 @@ void sync_virtual_pad(const Context& ctx) {
     if (in.buttonUpper[s]) buttons |= PAD_TRIGGER_Z;
     if (in.buttonLower[o]) buttons |= PAD_BUTTON_X;
     if (in.buttonUpper[o]) buttons |= PAD_BUTTON_Y;
-    if (in.menu) buttons |= PAD_BUTTON_START;
+    if (g_latched.start) buttons |= PAD_BUTTON_START;
     if (in.trigger[o] > 0.6f) {
         buttons |= PAD_TRIGGER_L;
         status.triggerLeft = 200;

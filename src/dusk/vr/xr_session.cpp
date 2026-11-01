@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -85,6 +86,8 @@ std::array<Swapchain, 2> g_swapchains;
 // HUD panel: a quad layer fed from the black/white HUD passes.
 Swapchain g_hud;
 wgpu::Texture g_hudBlack;  // first HUD pass, kept until the white pass composes
+wgpu::Texture g_hudGame;   // the game's HUD with alpha (premultiplied, display-referred)
+std::atomic<bool> g_hudGameReady{false};
 bool g_hudRendered = false;  // a new HUD image is waiting to be copied this frame
 bool g_hudValid = false;     // the HUD swapchain holds an image
 Pose g_hudPose;
@@ -137,7 +140,7 @@ PFN_xrDestroyHandTrackerEXT g_destroyHandTracker = nullptr;
 PFN_xrLocateHandJointsEXT g_locateHandJoints = nullptr;
 
 // Blit pipelines, created on the render worker.
-enum class BlitKind { Copy, HudCompose, Cursor, Eye, Crop };
+enum class BlitKind { Copy, HudCompose, Cursor, Eye, Crop, Panel };
 struct BlitPipeline {
     BlitKind kind = BlitKind::Copy;
     wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
@@ -150,6 +153,11 @@ wgpu::ShaderModule g_hudShader;
 wgpu::ShaderModule g_cursorShader;
 wgpu::ShaderModule g_eyeShader;
 wgpu::ShaderModule g_cropShader;
+wgpu::ShaderModule g_panelShader;
+wgpu::Buffer g_panelParams;
+wgpu::Texture g_transparent;
+wgpu::TextureView g_transparentView;
+bool g_transparentCleared = false;
 wgpu::Buffer g_cropParams;
 wgpu::Texture g_cropTexture;
 wgpu::Buffer g_eyeParams;
@@ -277,6 +285,60 @@ fn fs_srgb(in: VsOut) -> @location(0) vec4f {
 fn fs_unorm(in: VsOut) -> @location(0) vec4f {
     let c = textureSample(src, samp, in.uv);
     return vec4f(c.rgb * vignette(in.uv), 1.0);
+}
+)";
+
+// The panel: the game's HUD with Dusklight's menus over it. Both inputs are premultiplied and
+// display-referred; params.x = menus present, params.y = menus are an overlay (else opaque).
+constexpr char kPanelShader[] = R"(
+@group(0) @binding(0) var hud: texture_2d<f32>;
+@group(0) @binding(1) var ui: texture_2d<f32>;
+@group(0) @binding(2) var samp: sampler;
+@group(0) @binding(3) var<uniform> params: vec4f;
+
+struct VsOut {
+    @builtin(position) pos: vec4f,
+    @location(0) uv: vec2f,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
+    var o: VsOut;
+    let uv = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+    o.pos = vec4f(uv * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0), 0.0, 1.0);
+    o.uv = uv;
+    return o;
+}
+
+fn to_linear(c: vec3f) -> vec3f {
+    let lo = c / 12.92;
+    let hi = pow((c + vec3f(0.055)) / 1.055, vec3f(2.4));
+    return select(hi, lo, c <= vec3f(0.04045));
+}
+
+fn panel(uv: vec2f) -> vec4f {
+    let h = textureSample(hud, samp, uv);
+    var u = textureSample(ui, samp, uv);
+    if (params.x < 0.5) {
+        u = vec4f(0.0);
+    } else if (params.y < 0.5) {
+        u = vec4f(u.rgb, 1.0);
+    }
+    return u + h * (1.0 - u.a);
+}
+
+@fragment
+fn fs_srgb(in: VsOut) -> @location(0) vec4f {
+    let c = panel(in.uv);
+    if (c.a <= 0.004) {
+        return vec4f(0.0);
+    }
+    return vec4f(to_linear(c.rgb / c.a) * c.a, c.a);
+}
+
+@fragment
+fn fs_unorm(in: VsOut) -> @location(0) vec4f {
+    return panel(in.uv);
 }
 )";
 
@@ -430,6 +492,11 @@ const wgpu::RenderPipeline& blit_pipeline(
         cropWgsl.code = kCropShader;
         const wgpu::ShaderModuleDescriptor cropDesc{.nextInChain = &cropWgsl, .label = "VR crop"};
         g_cropShader = device.CreateShaderModule(&cropDesc);
+        g_panelParams = device.CreateBuffer(&paramsDesc);
+        wgpu::ShaderSourceWGSL panelWgsl;
+        panelWgsl.code = kPanelShader;
+        const wgpu::ShaderModuleDescriptor panelDesc{.nextInChain = &panelWgsl, .label = "VR panel"};
+        g_panelShader = device.CreateShaderModule(&panelDesc);
         const wgpu::SamplerDescriptor samplerDesc{
             .label = "VR eye blit sampler",
             .magFilter = wgpu::FilterMode::Linear,
@@ -441,6 +508,7 @@ const wgpu::RenderPipeline& blit_pipeline(
                                        kind == BlitKind::Cursor     ? g_cursorShader :
                                        kind == BlitKind::Eye        ? g_eyeShader :
                                        kind == BlitKind::Crop       ? g_cropShader :
+                                       kind == BlitKind::Panel      ? g_panelShader :
                                                                       g_blitShader;
     const wgpu::ColorTargetState target{.format = format};
     const wgpu::FragmentState fragment{
@@ -994,6 +1062,8 @@ void destroy_session() {
     g_cursorValid = false;
     g_cursorRendered = false;
     g_hudBlack = {};
+    g_hudGame = {};
+    g_hudGameReady = false;
     g_hudValid = false;
     g_hudRendered = false;
     for (int h = 0; h < 2; ++h) {
@@ -1174,6 +1244,10 @@ void shutdown() {
     g_cropShader = {};
     g_cropParams = {};
     g_cropTexture = {};
+    g_panelShader = {};
+    g_panelParams = {};
+    g_transparent = {};
+    g_transparentView = {};
     g_blitSampler = {};
 }
 
@@ -1351,33 +1425,153 @@ void crop_for_desktop(wgpu::CommandEncoder& encoder, const aurora::xr::PresentSo
     blit_rect(encoder, g_cropTexture.CreateView(), source.view, source.format, full);
 }
 
-void render_eye(int index, bool desktopCrop) {
-    auto& sc = g_swapchains[index];
+void begin_access(const wgpu::SharedTextureMemory& memory, const wgpu::Texture& target,
+    std::vector<aurora::xr::AfterSubmitCallback>& afterSubmit, bool& ok) {
+    wgpu::SharedTextureMemoryBeginAccessDescriptor begin{};
+    begin.initialized = false;
+    begin.fenceCount = 0;
+    ok = memory.BeginAccess(target, &begin) == wgpu::Status::Success;
+    if (ok) {
+        afterSubmit.push_back([target, memory] {
+            wgpu::SharedTextureMemoryEndAccessState state;
+            memory.EndAccess(target, &state);
+        });
+    }
+}
+
+const wgpu::TextureView& transparent_texture() {
+    if (!g_transparentView) {
+        const wgpu::TextureDescriptor desc{
+            .label = "VR transparent",
+            .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
+            .size = {1, 1, 1},
+            .format = wgpu::TextureFormat::RGBA8Unorm,
+        };
+        g_transparent = aurora::xr::device().CreateTexture(&desc);
+        g_transparentView = g_transparent.CreateView();
+        g_transparentCleared = false;
+    }
+    return g_transparentView;
+}
+
+// The floating panel: the game's HUD (drawn after each sim tick) with Dusklight's own menus on top
+// (drawn every frame), so menus stay live even before the game starts.
+void compose_panel(wgpu::CommandEncoder& encoder, const aurora::xr::PresentSource& source,
+    const wgpu::Texture& target, wgpu::TextureFormat format) {
+    const wgpu::Device device = aurora::xr::device();
+    const wgpu::TextureView& clear = transparent_texture();
+    if (!g_transparentCleared) {
+        const wgpu::RenderPassColorAttachment attachment{
+            .view = clear,
+            .loadOp = wgpu::LoadOp::Clear,
+            .storeOp = wgpu::StoreOp::Store,
+            .clearValue = {0.0, 0.0, 0.0, 0.0},
+        };
+        const wgpu::RenderPassDescriptor passDesc{
+            .label = "VR transparent clear",
+            .colorAttachmentCount = 1,
+            .colorAttachments = &attachment,
+        };
+        encoder.BeginRenderPass(&passDesc).End();
+        g_transparentCleared = true;
+    }
+    const bool hasHud = g_hudGameReady.load(std::memory_order_acquire);
+    const bool hasUi = static_cast<bool>(source.ui);
+    const float params[4] = {hasUi ? 1.f : 0.f, source.uiOverlay ? 1.f : 0.f, 0.f, 0.f};
+    aurora::xr::queue().WriteBuffer(g_panelParams, 0, params, sizeof(params));
+    const auto& pipeline = blit_pipeline(device, format, BlitKind::Panel);
+    const wgpu::BindGroupEntry entries[] = {
+        {.binding = 0, .textureView = hasHud ? g_hudGame.CreateView() : clear},
+        {.binding = 1, .textureView = hasUi ? source.ui : clear},
+        {.binding = 2, .sampler = g_blitSampler},
+        {.binding = 3, .buffer = g_panelParams, .size = 16},
+    };
+    const wgpu::BindGroupDescriptor bindDesc{
+        .layout = pipeline.GetBindGroupLayout(0),
+        .entryCount = 4,
+        .entries = entries,
+    };
+    const wgpu::RenderPassColorAttachment attachment{
+        .view = target.CreateView(),
+        .loadOp = wgpu::LoadOp::Clear,
+        .storeOp = wgpu::StoreOp::Store,
+        .clearValue = {0.0, 0.0, 0.0, 0.0},
+    };
+    const wgpu::RenderPassDescriptor passDesc{
+        .label = "VR panel",
+        .colorAttachmentCount = 1,
+        .colorAttachments = &attachment,
+    };
+    const auto pass = encoder.BeginRenderPass(&passDesc);
+    pass.SetPipeline(pipeline);
+    pass.SetBindGroup(0, device.CreateBindGroup(&bindDesc));
+    pass.Draw(3);
+    pass.End();
+}
+
+void draw_cursor(wgpu::CommandEncoder& encoder, const wgpu::Texture& target, wgpu::TextureFormat format) {
+    const wgpu::RenderPassColorAttachment attachment{
+        .view = target.CreateView(),
+        .loadOp = wgpu::LoadOp::Clear,
+        .storeOp = wgpu::StoreOp::Store,
+        .clearValue = {0.0, 0.0, 0.0, 0.0},
+    };
+    const wgpu::RenderPassDescriptor passDesc{
+        .label = "VR cursor",
+        .colorAttachmentCount = 1,
+        .colorAttachments = &attachment,
+    };
+    const auto pass = encoder.BeginRenderPass(&passDesc);
+    pass.SetPipeline(blit_pipeline(aurora::xr::device(), format, BlitKind::Cursor));
+    pass.Draw(3);
+    pass.End();
+}
+
+bool acquire_image(Swapchain& sc) {
+    if (sc.handle == XR_NULL_HANDLE || sc.acquired != UINT32_MAX) {
+        return false;
+    }
     uint32_t image = 0;
     XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
     if (XR_FAILED(xrAcquireSwapchainImage(sc.handle, &acquire, &image))) {
-        return;
+        return false;
     }
     XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
     wait.timeout = XR_INFINITE_DURATION;
     if (XR_FAILED(xrWaitSwapchainImage(sc.handle, &wait))) {
         XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         xrReleaseSwapchainImage(sc.handle, &release);
-        return;
+        return false;
     }
     sc.acquired = image;
+    return true;
+}
+
+void render_eye(int index, bool desktopCrop) {
+    auto& sc = g_swapchains[index];
+    if (!acquire_image(sc)) {
+        return;
+    }
     g_eyeRendered[index] = true;
+
+    // The right eye's frame also refreshes the panel (and, once, the cursor image).
+    const bool panel = index == 1 && acquire_image(g_hud);
+    g_hudRendered = g_hudRendered || panel;
+    const bool cursor = panel && !g_cursorValid && acquire_image(g_cursor);
+    g_cursorRendered = g_cursorRendered || cursor;
 
     aurora::xr::set_next_frame_hook(
         [target = sc.stagingTexture, memory = sc.stagingMemory, format = sc.format,
-            vignette = g_vignette, desktopCrop, eye = g_eyes[index]](
+            vignette = g_vignette, desktopCrop, eye = g_eyes[index], panel, cursor,
+            hudTarget = g_hud.stagingTexture, hudMemory = g_hud.stagingMemory, hudFormat = g_hud.format,
+            cursorTarget = g_cursor.stagingTexture, cursorMemory = g_cursor.stagingMemory,
+            cursorFormat = g_cursor.format](
             wgpu::CommandEncoder& encoder, const aurora::xr::PresentSource& source,
             std::vector<aurora::xr::AfterSubmitCallback>& afterSubmit) {
             const wgpu::Device device = aurora::xr::device();
-            wgpu::SharedTextureMemoryBeginAccessDescriptor begin{};
-            begin.initialized = false;
-            begin.fenceCount = 0;
-            if (memory.BeginAccess(target, &begin) != wgpu::Status::Success) {
+            bool ok = false;
+            begin_access(memory, target, afterSubmit, ok);
+            if (!ok) {
                 Log.error("BeginAccess on VR swapchain image failed");
                 return;
             }
@@ -1412,171 +1606,85 @@ void render_eye(int index, bool desktopCrop) {
             pass.SetBindGroup(0, bindGroup);
             pass.Draw(3);
             pass.End();
+
+            if (panel) {
+                bool hudOk = false;
+                begin_access(hudMemory, hudTarget, afterSubmit, hudOk);
+                if (hudOk) {
+                    compose_panel(encoder, source, hudTarget, hudFormat);
+                }
+            }
+            if (cursor) {
+                bool cursorOk = false;
+                begin_access(cursorMemory, cursorTarget, afterSubmit, cursorOk);
+                if (cursorOk) {
+                    draw_cursor(encoder, cursorTarget, cursorFormat);
+                }
+            }
             if (desktopCrop) {
                 crop_for_desktop(encoder, source, eye);
             }
-
-            afterSubmit.push_back([target, memory] {
-                wgpu::SharedTextureMemoryEndAccessState state;
-                memory.EndAccess(target, &state);
-            });
         });
 }
 
 void render_hud(int phase) {
-    if (phase == 0) {
-        // Keep the over-black pass for the compose step.
-        aurora::xr::set_next_frame_hook([](wgpu::CommandEncoder& encoder,
-                                             const aurora::xr::PresentSource& source,
-                                             std::vector<aurora::xr::AfterSubmitCallback>&) {
-            const wgpu::Device device = aurora::xr::device();
-            if (!g_hudBlack || g_hudBlack.GetWidth() != source.width ||
-                g_hudBlack.GetHeight() != source.height || g_hudBlack.GetFormat() != source.format)
-            {
-                const wgpu::TextureDescriptor desc{
-                    .label = "VR HUD over black",
-                    .usage = wgpu::TextureUsage::RenderAttachment |
-                             wgpu::TextureUsage::TextureBinding,
-                    .size = {source.width, source.height, 1},
-                    .format = source.format,
-                };
-                g_hudBlack = device.CreateTexture(&desc);
-            }
-            const auto& pipeline = blit_pipeline(device, source.format);
-            const wgpu::BindGroupEntry entries[] = {
-                {.binding = 0, .textureView = source.view},
-                {.binding = 1, .sampler = g_blitSampler},
-            };
-            const wgpu::BindGroupDescriptor bindDesc{
-                .layout = pipeline.GetBindGroupLayout(0),
-                .entryCount = 2,
-                .entries = entries,
-            };
-            const wgpu::RenderPassColorAttachment attachment{
-                .view = g_hudBlack.CreateView(),
-                .loadOp = wgpu::LoadOp::Clear,
-                .storeOp = wgpu::StoreOp::Store,
-            };
-            const wgpu::RenderPassDescriptor passDesc{
-                .label = "VR HUD capture",
-                .colorAttachmentCount = 1,
-                .colorAttachments = &attachment,
-            };
-            const auto pass = encoder.BeginRenderPass(&passDesc);
-            pass.SetPipeline(pipeline);
-            pass.SetBindGroup(0, device.CreateBindGroup(&bindDesc));
-            pass.Draw(3);
-            pass.End();
-        });
-        return;
-    }
-
-    if (g_hud.handle == XR_NULL_HANDLE || g_hud.acquired != UINT32_MAX) {
-        return;
-    }
-    uint32_t image = 0;
-    XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    if (XR_FAILED(xrAcquireSwapchainImage(g_hud.handle, &acquire, &image))) {
-        return;
-    }
-    XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-    wait.timeout = XR_INFINITE_DURATION;
-    if (XR_FAILED(xrWaitSwapchainImage(g_hud.handle, &wait))) {
-        XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        xrReleaseSwapchainImage(g_hud.handle, &release);
-        return;
-    }
-    g_hud.acquired = image;
-    g_hudRendered = true;
-
-    // The cursor image is drawn once, alongside the first HUD.
-    bool drawCursor = false;
-    if (!g_cursorValid && g_cursor.handle != XR_NULL_HANDLE && g_cursor.acquired == UINT32_MAX) {
-        uint32_t cursorImage = 0;
-        if (XR_SUCCEEDED(xrAcquireSwapchainImage(g_cursor.handle, &acquire, &cursorImage)) &&
-            XR_SUCCEEDED(xrWaitSwapchainImage(g_cursor.handle, &wait)))
+    // Phase 0 keeps the HUD drawn over black; phase 1 (over white) recovers its alpha into
+    // g_hudGame, which the panel picks up on the next frame.
+    aurora::xr::set_next_frame_hook([phase](wgpu::CommandEncoder& encoder,
+                                        const aurora::xr::PresentSource& source,
+                                        std::vector<aurora::xr::AfterSubmitCallback>&) {
+        const wgpu::Device device = aurora::xr::device();
+        wgpu::Texture& out = phase == 0 ? g_hudBlack : g_hudGame;
+        const wgpu::TextureFormat outFormat =
+            phase == 0 ? source.format : wgpu::TextureFormat::RGBA8Unorm;
+        if (!out || out.GetWidth() != source.width || out.GetHeight() != source.height ||
+            out.GetFormat() != outFormat)
         {
-            g_cursor.acquired = cursorImage;
-            g_cursorRendered = true;
-            drawCursor = true;
+            const wgpu::TextureDescriptor desc{
+                .label = phase == 0 ? "VR HUD over black" : "VR HUD",
+                .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
+                .size = {source.width, source.height, 1},
+                .format = outFormat,
+            };
+            out = device.CreateTexture(&desc);
         }
-    }
-
-    aurora::xr::set_next_frame_hook(
-        [target = g_hud.stagingTexture, memory = g_hud.stagingMemory, format = g_hud.format,
-            drawCursor, cursorTarget = g_cursor.stagingTexture,
-            cursorMemory = g_cursor.stagingMemory, cursorFormat = g_cursor.format](
-            wgpu::CommandEncoder& encoder, const aurora::xr::PresentSource& source,
-            std::vector<aurora::xr::AfterSubmitCallback>& afterSubmit) {
-            const wgpu::Device device = aurora::xr::device();
-            if (drawCursor) {
-                wgpu::SharedTextureMemoryBeginAccessDescriptor cursorBegin{};
-                cursorBegin.initialized = false;
-                cursorBegin.fenceCount = 0;
-                if (cursorMemory.BeginAccess(cursorTarget, &cursorBegin) == wgpu::Status::Success) {
-                    const wgpu::RenderPassColorAttachment attachment{
-                        .view = cursorTarget.CreateView(),
-                        .loadOp = wgpu::LoadOp::Clear,
-                        .storeOp = wgpu::StoreOp::Store,
-                        .clearValue = {0.0, 0.0, 0.0, 0.0},
-                    };
-                    const wgpu::RenderPassDescriptor passDesc{
-                        .label = "VR cursor",
-                        .colorAttachmentCount = 1,
-                        .colorAttachments = &attachment,
-                    };
-                    const auto pass = encoder.BeginRenderPass(&passDesc);
-                    pass.SetPipeline(blit_pipeline(device, cursorFormat, BlitKind::Cursor));
-                    pass.Draw(3);
-                    pass.End();
-                    afterSubmit.push_back([cursorTarget, cursorMemory] {
-                        wgpu::SharedTextureMemoryEndAccessState state;
-                        cursorMemory.EndAccess(cursorTarget, &state);
-                    });
-                }
-            }
-            if (!g_hudBlack) {
-                return;
-            }
-            wgpu::SharedTextureMemoryBeginAccessDescriptor begin{};
-            begin.initialized = false;
-            begin.fenceCount = 0;
-            if (memory.BeginAccess(target, &begin) != wgpu::Status::Success) {
-                Log.error("BeginAccess on the VR HUD texture failed");
-                return;
-            }
-            const auto& pipeline = blit_pipeline(device, format, BlitKind::HudCompose);
-            const wgpu::BindGroupEntry entries[] = {
-                {.binding = 0, .textureView = g_hudBlack.CreateView()},
-                {.binding = 1, .textureView = source.view},
-                {.binding = 2, .sampler = g_blitSampler},
-            };
-            const wgpu::BindGroupDescriptor bindDesc{
-                .layout = pipeline.GetBindGroupLayout(0),
-                .entryCount = 3,
-                .entries = entries,
-            };
-            const wgpu::RenderPassColorAttachment attachment{
-                .view = target.CreateView(),
-                .loadOp = wgpu::LoadOp::Clear,
-                .storeOp = wgpu::StoreOp::Store,
-                .clearValue = {0.0, 0.0, 0.0, 0.0},
-            };
-            const wgpu::RenderPassDescriptor passDesc{
-                .label = "VR HUD compose",
-                .colorAttachmentCount = 1,
-                .colorAttachments = &attachment,
-            };
-            const auto pass = encoder.BeginRenderPass(&passDesc);
-            pass.SetPipeline(pipeline);
-            pass.SetBindGroup(0, device.CreateBindGroup(&bindDesc));
-            pass.Draw(3);
-            pass.End();
-            afterSubmit.push_back([target, memory] {
-                wgpu::SharedTextureMemoryEndAccessState state;
-                memory.EndAccess(target, &state);
-            });
-        });
+        if (phase != 0 && !g_hudBlack) {
+            return;
+        }
+        const auto& pipeline =
+            blit_pipeline(device, outFormat, phase == 0 ? BlitKind::Copy : BlitKind::HudCompose);
+        std::vector<wgpu::BindGroupEntry> entries;
+        if (phase == 0) {
+            entries = {{.binding = 0, .textureView = source.view}, {.binding = 1, .sampler = g_blitSampler}};
+        } else {
+            entries = {{.binding = 0, .textureView = g_hudBlack.CreateView()},
+                {.binding = 1, .textureView = source.view}, {.binding = 2, .sampler = g_blitSampler}};
+        }
+        const wgpu::BindGroupDescriptor bindDesc{
+            .layout = pipeline.GetBindGroupLayout(0),
+            .entryCount = entries.size(),
+            .entries = entries.data(),
+        };
+        const wgpu::RenderPassColorAttachment attachment{
+            .view = out.CreateView(),
+            .loadOp = wgpu::LoadOp::Clear,
+            .storeOp = wgpu::StoreOp::Store,
+            .clearValue = {0.0, 0.0, 0.0, 0.0},
+        };
+        const wgpu::RenderPassDescriptor passDesc{
+            .label = "VR HUD",
+            .colorAttachmentCount = 1,
+            .colorAttachments = &attachment,
+        };
+        const auto pass = encoder.BeginRenderPass(&passDesc);
+        pass.SetPipeline(pipeline);
+        pass.SetBindGroup(0, device.CreateBindGroup(&bindDesc));
+        pass.Draw(3);
+        pass.End();
+        if (phase != 0) {
+            g_hudGameReady.store(true, std::memory_order_release);
+        }
+    });
 }
 
 void set_vignette(float amount) { g_vignette = std::clamp(amount, 0.f, 1.f); }
