@@ -25,7 +25,9 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <vector>
 #include <cmath>
 
 namespace dusk::vr {
@@ -33,14 +35,20 @@ namespace {
 
 constexpr borealis::Log Log{"vr"};
 
-// Human Link's hand joints and the item joints parented to them. Link is left handed: the sword
-// sits in the left hand, the shield in the right. The hand model's joints 1 and 2 copy the hands.
-constexpr int kSwordHandJoint = 9;
-constexpr int kSwordItemJoint = 10;
-constexpr int kShieldHandJoint = 14;
-constexpr int kShieldItemJoint = 15;
-constexpr int kSwordHandModelJoint = 1;
-constexpr int kShieldHandModelJoint = 2;
+// Human Link's arms (from the model's skeleton: shoulder, upper arm, forearm, hand, weapon). Each
+// controller drives the arm on its own side. The hand model's joints 1 and 2 copy the hands.
+struct ArmChain {
+    int shoulder, upper, lower, hand, weapon, handModelJoint;
+};
+constexpr ArmChain kLeftArm{6, 7, 8, 9, 10, 1};
+constexpr ArmChain kRightArm{11, 12, 13, 14, 15, 2};
+constexpr int kHeadJoint = 4;  // same index for human and wolf Link
+
+const ArmChain& arm_for(xr::Hand hand) { return hand == xr::kLeft ? kLeftArm : kRightArm; }
+
+// The game puts the sword on the "left item" joint and the shield on the "right" one (Link is left
+// handed). In VR they follow the player's handedness.
+bool g_itemsSwapped = false;
 
 // Item joint axes in the controller's grip frame: the blade runs along the item joint's +X (the
 // game puts the sword tip at +X), its edges face +/-Z. A sword held like the controller points
@@ -56,6 +64,7 @@ struct HandPlacement {
 HandPlacement g_placements[2];
 
 void latch_hands(daAlink_c* link, float step);
+void hide_head(J3DModel* model);
 
 bool g_initialized = false;
 bool g_active = false;
@@ -84,6 +93,9 @@ bool g_needsRecenter = true;
 // Player snapshots per sim tick, for interpolated presentation.
 cXyz g_linkPrev, g_linkCurr;
 float g_eyeHeightPrev = 0.f, g_eyeHeightCurr = 0.f;
+// Link's eyes sit ahead of his feet; the camera goes there, not above the middle of his body.
+float g_eyeFwdPrev = 0.f, g_eyeFwdCurr = 0.f;
+s16 g_facingPrev = 0, g_facingCurr = 0;
 bool g_linkValid = false;
 bool g_wasWolf = false;
 
@@ -94,6 +106,11 @@ bool g_bowReady = false;
 int g_bowSlot = 0;
 bool g_prevSwordHit = false;
 bool g_prevDamaged = false;
+bool g_wolf = false;
+bool g_climbing = false;
+bool g_swimming = false;
+bool g_riding = false;
+bool g_bodyTurning = false;
 
 double g_lastDisplayTime = 0.0;
 bool g_firstPersonFrame = false;
@@ -234,8 +251,24 @@ Vec3 tracking_to_world_fp(const Vec3& p, const Vec3& anchor) {
     return anchor + Quat::yaw(g_yawOffset).rotate(local) * units_per_meter();
 }
 
-Vec3 first_person_anchor(const cXyz& feet, float eyeHeight) {
-    return {feet.x, feet.y + eyeHeight + getSettings().vr.heightOffset.getValue(), feet.z};
+// The world point that the tracking space's origin (the recentered head) maps to: Link's eyes.
+Vec3 first_person_anchor(const cXyz& feet, float eyeHeight, s16 facing, float eyeFwd) {
+    return {feet.x + cM_ssin(facing) * eyeFwd,
+        feet.y + eyeHeight + getSettings().vr.heightOffset.getValue(),
+        feet.z + cM_scos(facing) * eyeFwd};
+}
+
+// The eye anchor between the last two sim ticks.
+Vec3 interpolated_anchor(float step) {
+    cXyz feet;
+    feet.x = g_linkPrev.x + (g_linkCurr.x - g_linkPrev.x) * step;
+    feet.y = g_linkPrev.y + (g_linkCurr.y - g_linkPrev.y) * step;
+    feet.z = g_linkPrev.z + (g_linkCurr.z - g_linkPrev.z) * step;
+    const float eyeHeight = g_eyeHeightPrev + (g_eyeHeightCurr - g_eyeHeightPrev) * step;
+    const float eyeFwd = g_eyeFwdPrev + (g_eyeFwdCurr - g_eyeFwdPrev) * step;
+    const s16 facing =
+        static_cast<s16>(g_facingPrev + static_cast<s16>(g_facingCurr - g_facingPrev) * step);
+    return first_person_anchor(feet, eyeHeight, facing, eyeFwd);
 }
 
 // The HUD panel floats in front of you and lazily turns to follow your gaze, so it stays readable
@@ -413,6 +446,10 @@ bool begin_frame() {
     g_ctx.locked = g_locked;
     g_ctx.bowReady = g_bowReady;
     g_ctx.bowSlot = g_bowSlot;
+    g_ctx.wolf = g_wolf;
+    g_ctx.climbing = g_climbing;
+    g_ctx.swimming = g_swimming;
+    g_ctx.riding = g_riding;
     g_ctx.standingHeight = g_standingHeight;
 
     if (g_needsRecenter && g_linkValid) {
@@ -424,6 +461,12 @@ bool begin_frame() {
 
     const auto result = input::update_frame(xr::input(), xr::head(), dt, g_ctx);
     turn(result.turnRad);
+    {
+        static float vignette = 0.f;
+        const float target = getSettings().vr.comfortVignette && g_firstPersonFrame ? result.motion : 0.f;
+        vignette += (target - vignette) * std::min(1.f, dt * 6.f);
+        xr::set_vignette(vignette);
+    }
     if (result.recenter) {
         recenter();
     }
@@ -495,6 +538,38 @@ void before_sim_tick() {
     if (link == nullptr || !g_firstPersonFrame || !xr::head_valid()) {
         return;
     }
+    // Like a VR avatar: standing still, the body turns to face where you look once you look far
+    // enough away.
+    switch (link->mProcID) {
+    case daAlink_c::PROC_WAIT:
+    case daAlink_c::PROC_TIRED_WAIT:
+    case daAlink_c::PROC_SERVICE_WAIT:
+    case daAlink_c::PROC_WOLF_WAIT:
+    case daAlink_c::PROC_WOLF_TIRED_WAIT:
+    case daAlink_c::PROC_WOLF_SERVICE_WAIT:
+        if (!g_locked && link->mLinkAcch.ChkGroundHit()) {
+            const Vec3 fwd = Quat::yaw(g_yawOffset).rotate(xr::head().forward());
+            const s16 diff = static_cast<s16>(game_yaw(fwd) - link->shape_angle.y);
+            if (std::abs(diff) > 0x2000) {
+                g_bodyTurning = true;
+            } else if (std::abs(diff) < 0x0400) {
+                g_bodyTurning = false;
+            }
+            if (g_bodyTurning) {
+                // Pivot around the eyes so the view doesn't swing as the body turns under it.
+                const s16 before = link->shape_angle.y;
+                link->shape_angle.y += std::clamp<s16>(diff, -0x0A00, 0x0A00);
+                link->current.angle.y = link->shape_angle.y;
+                link->current.pos.x += (cM_ssin(before) - cM_ssin(link->shape_angle.y)) * g_eyeFwdCurr;
+                link->current.pos.z += (cM_scos(before) - cM_scos(link->shape_angle.y)) * g_eyeFwdCurr;
+            }
+        }
+        break;
+    default:
+        g_bodyTurning = false;
+        break;
+    }
+
     const Vec3 head = xr::head().position;
     const Vec3 offset{head.x - g_body.x, 0.f, head.z - g_body.z};
     if (!getSettings().vr.roomScale || !can_room_scale(link)) {
@@ -515,6 +590,23 @@ void before_sim_tick() {
     g_body.z = head.z;
 }
 
+// Debug aid: DUSK_VR_DUMP_JOINTS=1 logs Link's skeleton (index, name, parent) once per form.
+void dump_skeleton(J3DModel* model, const char* label) {
+    J3DModelData* data = model->getModelData();
+    const u16 count = data->getJointNum();
+    std::vector<int> parent(count, -1);
+    for (u16 i = 0; i < count; ++i) {
+        J3DJoint* joint = data->getJointNodePointer(i);
+        for (J3DJoint* child = joint->getChild(); child != nullptr; child = child->getYounger()) {
+            parent[child->getJntNo()] = i;
+        }
+    }
+    JUTNameTab* names = data->getJointName();
+    for (u16 i = 0; i < count; ++i) {
+        Log.info("{} joint {} '{}' parent {}", label, i, names ? names->getName(i) : "?", parent[i]);
+    }
+}
+
 void after_sim_tick() {
     // The HUD only changes when the game does.
     g_hudPending = true;
@@ -529,6 +621,41 @@ void after_sim_tick() {
     g_bowReady = !link->checkWolf() && link->checkBowAndSlingItem(link->mEquipItem) &&
                  link->checkBowAnime();
     g_bowSlot = link->mSelectItemId;
+    g_wolf = link->checkWolf();
+    g_riding = link->checkHorseRide();
+    switch (link->mProcID) {
+    case daAlink_c::PROC_LADDER_UP_START:
+    case daAlink_c::PROC_LADDER_UP_END:
+    case daAlink_c::PROC_LADDER_DOWN_START:
+    case daAlink_c::PROC_LADDER_DOWN_END:
+    case daAlink_c::PROC_LADDER_MOVE:
+    case daAlink_c::PROC_CLIMB_UP_START:
+    case daAlink_c::PROC_CLIMB_DOWN_START:
+    case daAlink_c::PROC_CLIMB_MOVE_UPDOWN:
+    case daAlink_c::PROC_CLIMB_MOVE_SIDE:
+    case daAlink_c::PROC_CLIMB_WAIT:
+    case daAlink_c::PROC_HANG_WAIT:
+    case daAlink_c::PROC_HANG_MOVE:
+    case daAlink_c::PROC_ROOF_HANG_WAIT:
+    case daAlink_c::PROC_ROOF_HANG_FRONT_MOVE:
+    case daAlink_c::PROC_ROOF_HANG_SIDE_MOVE:
+        g_climbing = true;
+        break;
+    default:
+        g_climbing = false;
+        break;
+    }
+    switch (link->mProcID) {
+    case daAlink_c::PROC_SWIM_WAIT:
+    case daAlink_c::PROC_SWIM_MOVE:
+    case daAlink_c::PROC_WOLF_SWIM_WAIT:
+    case daAlink_c::PROC_WOLF_SWIM_MOVE:
+        g_swimming = true;
+        break;
+    default:
+        g_swimming = false;
+        break;
+    }
 
     // Feel what Link feels: the blade connecting, and getting hurt.
     if (g_active) {
@@ -546,23 +673,43 @@ void after_sim_tick() {
         g_prevDamaged = damaged;
     }
     g_controllable = player_controllable(link);
+    static bool dumpedHuman = false, dumpedWolf = false;
+    if (std::getenv("DUSK_VR_DUMP_JOINTS") != nullptr && link->mpLinkModel != nullptr) {
+        bool& dumped = link->checkWolf() ? dumpedWolf : dumpedHuman;
+        if (!dumped) {
+            dump_skeleton(link->mpLinkModel, link->checkWolf() ? "wolf" : "human");
+            dumped = true;
+        }
+    }
     const daPy_py_c* player = link;
     g_locked = player->checkAttentionLock() || player->checkEnemyAttentionLock();
     const float targetEye = link->eyePos.y - link->current.pos.y;
+    const s16 facing = link->shape_angle.y;
+    const float targetFwd = std::clamp(
+        (link->eyePos.x - link->current.pos.x) * cM_ssin(facing) +
+            (link->eyePos.z - link->current.pos.z) * cM_scos(facing),
+        0.f, link->checkWolf() ? 100.f : 25.f);
     const bool wolf = link->checkWolf();
     if (!g_linkValid || wolf != g_wasWolf) {
         g_linkPrev = g_linkCurr = link->current.pos;
         g_eyeHeightPrev = g_eyeHeightCurr = targetEye;
+        g_eyeFwdPrev = g_eyeFwdCurr = targetFwd;
+        g_facingPrev = g_facingCurr = facing;
     } else {
         g_linkPrev = g_linkCurr;
         g_linkCurr = link->current.pos;
         g_eyeHeightPrev = g_eyeHeightCurr;
-        // Smooth out animation bob in the eye height.
+        g_eyeFwdPrev = g_eyeFwdCurr;
+        g_facingPrev = g_facingCurr;
+        g_facingCurr = facing;
+        // Smooth out animation bob in the eye position.
         g_eyeHeightCurr += (targetEye - g_eyeHeightCurr) * 0.3f;
+        g_eyeFwdCurr += (targetFwd - g_eyeFwdCurr) * 0.2f;
     }
     // Teleports (loading zones, warps) shouldn't be interpolated across.
     if (g_linkPrev.abs(g_linkCurr) > 300.f) {
         g_linkPrev = g_linkCurr;
+        g_facingPrev = g_facingCurr;
     }
     g_wasWolf = wolf;
     g_linkValid = true;
@@ -578,13 +725,9 @@ bool apply_eye_view(view_class* view, float step) {
     Vec3 eyePos;
     Quat eyeRot;
     if (g_firstPersonFrame) {
-        cXyz feet;
-        feet.x = g_linkPrev.x + (g_linkCurr.x - g_linkPrev.x) * step;
-        feet.y = g_linkPrev.y + (g_linkCurr.y - g_linkPrev.y) * step;
-        feet.z = g_linkPrev.z + (g_linkCurr.z - g_linkPrev.z) * step;
-        const float eyeHeight = g_eyeHeightPrev + (g_eyeHeightCurr - g_eyeHeightPrev) * step;
-        eyePos = tracking_to_world_fp(eye.pose.position, first_person_anchor(feet, eyeHeight));
-        eyePos.y = std::max(eyePos.y, feet.y + 20.f);
+        const float feetY = g_linkPrev.y + (g_linkCurr.y - g_linkPrev.y) * step;
+        eyePos = tracking_to_world_fp(eye.pose.position, interpolated_anchor(step));
+        eyePos.y = std::max(eyePos.y, feetY + 20.f);
         eyeRot = Quat::yaw(g_yawOffset) * eye.pose.orientation;
     } else {
         // Third person and cutscenes: head tracking on top of the game camera, horizon level.
@@ -594,9 +737,13 @@ bool apply_eye_view(view_class* view, float step) {
         eyeRot = Quat::yaw(base) * eye.pose.orientation;
     }
 
-    if (g_firstPersonFrame && getSettings().vr.motionControls) {
-        if (daAlink_c* link = get_link(); link != nullptr && !link->checkWolf()) {
-            latch_hands(link, step);
+    if (g_firstPersonFrame) {
+        if (daAlink_c* link = get_link(); link != nullptr && link->mpLinkModel != nullptr) {
+            // You are inside Link's head: only your own eyes skip drawing it.
+            hide_head(link->mpLinkModel);
+            if (!link->checkWolf() && getSettings().vr.motionControls) {
+                latch_hands(link, step);
+            }
         }
     }
 
@@ -664,41 +811,167 @@ s16 control_angle_y(s16 gameCameraAngle) {
 
 bool first_person() { return g_active && g_firstPersonFrame; }
 
-bool hide_link_body() { return first_person(); }
+bool hide_link_body() { return first_person() && !getSettings().vr.fullBody; }
 
-void override_link_hands(daAlink_c* link) {
-    if (!first_person() || !getSettings().vr.motionControls || link->checkWolf() ||
-        link->mpLinkModel == nullptr || !g_linkValid)
-    {
+bool hide_link_head() { return first_person(); }
+
+namespace {
+
+Vec3 mtx_pos(const Mtx m) { return {m[0][3], m[1][3], m[2][3]}; }
+
+// Rotates a world matrix by q about pivot, then moves it.
+void rotate_about(Mtx m, const Quat& q, const Vec3& pivot, const Vec3& move) {
+    for (int c = 0; c < 3; ++c) {
+        const Vec3 axis = q.rotate({m[0][c], m[1][c], m[2][c]});
+        m[0][c] = axis.x;
+        m[1][c] = axis.y;
+        m[2][c] = axis.z;
+    }
+    const Vec3 p = q.rotate(mtx_pos(m) - pivot) + pivot + move;
+    m[0][3] = p.x;
+    m[1][3] = p.y;
+    m[2][3] = p.z;
+}
+
+void collect_subtree(J3DModelData* data, int root, std::vector<u16>& out) {
+    out.clear();
+    std::vector<J3DJoint*> stack{data->getJointNodePointer(root)};
+    while (!stack.empty()) {
+        J3DJoint* joint = stack.back();
+        stack.pop_back();
+        out.push_back(joint->getJntNo());
+        for (J3DJoint* child = joint->getChild(); child != nullptr; child = child->getYounger()) {
+            stack.push_back(child);
+        }
+    }
+}
+
+// Two-bone IK: bends the arm so the weapon joint lands on the controller. The elbow hangs down
+// and out to the side, the way a relaxed arm does. Reaching past full extension stretches the arm
+// a little rather than letting the hand fall short of the controller.
+void solve_arm(J3DModel* model, const ArmChain& chain, const Mtx weaponTarget, const Vec3& bodyFwd,
+    const Vec3& bodyRight, bool leftSide) {
+    J3DModelData* data = model->getModelData();
+    const auto M = [&](int j) { return model->getAnmMtx(j); };
+
+    // Where the hand must be for the weapon joint to hit the target.
+    Mtx handInv, rel, relInv, handTarget;
+    MTXInverse(M(chain.hand), handInv);
+    MTXConcat(handInv, M(chain.weapon), rel);
+    MTXInverse(rel, relInv);
+    MTXConcat(weaponTarget, relInv, handTarget);
+
+    const Vec3 shoulder = mtx_pos(M(chain.upper));
+    const Vec3 elbow = mtx_pos(M(chain.lower));
+    const Vec3 wrist = mtx_pos(M(chain.hand));
+    const Vec3 target = mtx_pos(handTarget);
+    float upperLen = (elbow - shoulder).length();
+    float lowerLen = (wrist - elbow).length();
+    const Vec3 toTarget = target - shoulder;
+    const float dist = toTarget.length();
+    if (upperLen < 1e-3f || lowerLen < 1e-3f || dist < 1e-3f) {
         return;
     }
-    const auto& in = xr::input();
-    const Vec3 anchor = first_person_anchor(link->current.pos, g_eyeHeightCurr);
+    const float stretch = std::clamp(dist / ((upperLen + lowerLen) * 0.999f), 1.f, 1.3f);
+    upperLen *= stretch;
+    lowerLen *= stretch;
+    const Vec3 dir = toTarget * (1.f / dist);
+    const float d = std::clamp(dist, std::fabs(upperLen - lowerLen) + 1e-3f,
+        (upperLen + lowerLen) * 0.9999f);
+    const float along = (upperLen * upperLen - lowerLen * lowerLen + d * d) / (2.f * d);
+    const float out = std::sqrt(std::max(0.f, upperLen * upperLen - along * along));
+    const Vec3 side = leftSide ? bodyRight * -1.f : bodyRight;
+    const Vec3 pole = Vec3{0.f, -1.f, 0.f} + side * 0.6f + bodyFwd * -0.3f;
+    Vec3 bend = pole - dir * pole.dot(dir);
+    bend = bend.length() > 1e-4f ? bend.normalized() : Vec3{0.f, -1.f, 0.f};
+    const Vec3 newElbow = shoulder + dir * along + bend * out;
 
-    // The controller holds the item joint (where the game attaches the sword, shield or tool);
-    // the hand follows it rigidly.
-    const auto place = [&](xr::Hand hand, int handJoint, int itemJoint) {
+    std::vector<u16> joints;
+    // Upper arm (and everything below it) swings about the shoulder.
+    collect_subtree(data, chain.upper, joints);
+    const Quat upperRot = from_to(elbow - shoulder, newElbow - shoulder);
+    for (u16 j : joints) {
+        rotate_about(M(j), upperRot, shoulder, {});
+    }
+    // Forearm moves to the new elbow and turns toward the wrist target.
+    collect_subtree(data, chain.lower, joints);
+    const Vec3 movedElbow = mtx_pos(M(chain.lower));
+    const Vec3 movedWrist = mtx_pos(M(chain.hand));
+    const Quat lowerRot = from_to(movedWrist - movedElbow, target - newElbow);
+    for (u16 j : joints) {
+        rotate_about(M(j), lowerRot, movedElbow, newElbow - movedElbow);
+    }
+    // The hand (and weapon) take the controller's pose exactly.
+    collect_subtree(data, chain.hand, joints);
+    Mtx inv, delta;
+    MTXInverse(M(chain.hand), inv);
+    MTXConcat(handTarget, inv, delta);
+    for (u16 j : joints) {
+        Mtx m;
+        MTXConcat(delta, M(j), m);
+        MTXCopy(m, M(j));
+    }
+}
+
+void restore_item_joints(daAlink_c* link) {
+    if (g_itemsSwapped && !link->checkWolf()) {
+        link->mLeftItemJntNo = kLeftArm.weapon;
+        link->mRightItemJntNo = kRightArm.weapon;
+    }
+    g_itemsSwapped = false;
+}
+
+}  // namespace
+
+void override_link_hands(daAlink_c* link) {
+    J3DModel* model = link->mpLinkModel;
+    if (!first_person() || !getSettings().vr.motionControls || link->checkWolf() ||
+        model == nullptr || !g_linkValid)
+    {
+        restore_item_joints(link);
+        g_placements[xr::kLeft].valid = g_placements[xr::kRight].valid = false;
+        return;
+    }
+
+    // The sword goes in the player's sword hand, on that side of Link's body.
+    const bool swordRight = !getSettings().vr.leftHanded;
+    link->mLeftItemJntNo = swordRight ? kRightArm.weapon : kLeftArm.weapon;
+    link->mRightItemJntNo = swordRight ? kLeftArm.weapon : kRightArm.weapon;
+    g_itemsSwapped = swordRight;
+
+    const auto& in = xr::input();
+    const Vec3 anchor =
+        first_person_anchor(link->current.pos, g_eyeHeightCurr, link->shape_angle.y, g_eyeFwdCurr);
+    const Vec3 fwd{cM_ssin(link->shape_angle.y), 0.f, cM_scos(link->shape_angle.y)};
+    const Vec3 right{-fwd.z, 0.f, fwd.x};
+
+    bool posed = false;
+    for (const xr::Hand hand : {xr::kLeft, xr::kRight}) {
         const auto& state = in.hands[hand];
         g_placements[hand].valid = false;
         if (!state.active) {
-            return;
+            continue;
         }
         Mtx& target = g_placements[hand].simTarget;
         build_world_matrix(target, Quat::yaw(g_yawOffset) * state.grip.orientation * item_offset(hand),
             tracking_to_world_fp(state.grip.position, anchor));
-
-        MtxP item = link->mpLinkModel->getAnmMtx(itemJoint);
-        MtxP handMtx = link->mpLinkModel->getAnmMtx(handJoint);
-        Mtx inv, delta, moved;
-        MTXInverse(item, inv);
-        MTXConcat(target, inv, delta);
-        MTXConcat(delta, handMtx, moved);
-        MTXCopy(moved, handMtx);
-        MTXCopy(target, item);
+        solve_arm(model, arm_for(hand), target, fwd, right, hand == xr::kLeft);
         g_placements[hand].valid = true;
-    };
-    place(input::sword_hand(), kSwordHandJoint, kSwordItemJoint);
-    place(input::shield_hand(), kShieldHandJoint, kShieldItemJoint);
+        posed = true;
+    }
+    if (!posed) {
+        return;
+    }
+    // Skinned vertices (elbows, shoulders) follow the new joints, and interpolation sees the posed
+    // skeleton rather than the animation's.
+    model->calcWeightEnvelopeMtx();
+    J3DModelData* data = model->getModelData();
+    for (u16 i = 0; i < data->getJointNum(); ++i) {
+        interp::record_final_mtx(model->getAnmMtx(i));
+    }
+    for (u16 i = 0; i < data->getWEvlpMtxNum(); ++i) {
+        interp::record_final_mtx(model->getWeightAnmMtx(i));
+    }
 }
 
 namespace {
@@ -727,14 +1000,13 @@ void override_model(J3DModel* model, const Mtx delta) {
 // the game's 30 Hz.
 void latch_hands(daAlink_c* link, float step) {
     const auto& in = xr::input();
-    cXyz feet;
-    feet.x = g_linkPrev.x + (g_linkCurr.x - g_linkPrev.x) * step;
-    feet.y = g_linkPrev.y + (g_linkCurr.y - g_linkPrev.y) * step;
-    feet.z = g_linkPrev.z + (g_linkCurr.z - g_linkPrev.z) * step;
-    const float eyeHeight = g_eyeHeightPrev + (g_eyeHeightCurr - g_eyeHeightPrev) * step;
-    const Vec3 anchor = first_person_anchor(feet, eyeHeight);
+    const Vec3 anchor = interpolated_anchor(step);
 
-    const auto latch = [&](xr::Hand hand, int handJoint, int itemJoint, int handModelJoint) {
+    const auto latch = [&](xr::Hand hand) {
+        const ArmChain& chain = arm_for(hand);
+        const int handJoint = chain.hand;
+        const int itemJoint = chain.weapon;
+        const int handModelJoint = chain.handModelJoint;
         const auto& state = in.hands[hand];
         if (!g_placements[hand].valid || !state.active) {
             return;
@@ -763,8 +1035,31 @@ void latch_hands(daAlink_c* link, float step) {
             }
         }
     };
-    latch(input::sword_hand(), kSwordHandJoint, kSwordItemJoint, kSwordHandModelJoint);
-    latch(input::shield_hand(), kShieldHandJoint, kShieldItemJoint, kShieldHandModelJoint);
+    latch(xr::kLeft);
+    latch(xr::kRight);
+}
+
+void hide_head(J3DModel* model) {
+    // Collapse the neck too (the head's parent), or you look down into the collar.
+    J3DModelData* data = model->getModelData();
+    int root = kHeadJoint;
+    for (u16 i = 1; i < data->getJointNum(); ++i) {
+        J3DJoint* first = data->getJointNodePointer(i)->getChild();
+        // Only a neck that carries nothing but the head (not a spine joint with legs on it).
+        if (first != nullptr && first->getJntNo() == kHeadJoint && first->getYounger() == nullptr) {
+            root = i;
+        }
+    }
+    static std::vector<u16> joints;
+    collect_subtree(data, root, joints);
+    for (u16 j : joints) {
+        MtxP m = model->getAnmMtx(j);
+        Mtx collapsed{};
+        collapsed[0][3] = m[0][3];
+        collapsed[1][3] = m[1][3];
+        collapsed[2][3] = m[2][3];
+        interp::set_presentation_override(m, collapsed);
+    }
 }
 
 }  // namespace
@@ -862,6 +1157,8 @@ void draw_imgui_window(bool* open) {
     checkbox("Physical crouch", vr.physicalCrouch);
     ImGui::SeparatorText("Motion controls");
     checkbox("Motion controls", vr.motionControls);
+    checkbox("Full body (first person)", vr.fullBody);
+    checkbox("Comfort vignette while moving", vr.comfortVignette);
     checkbox("Left handed (sword in left controller)", vr.leftHanded);
     sliderF("Swing speed", vr.swingSpeed, 1.0f, 5.0f, "%.1f m/s");
     sliderF("Sword pitch", vr.handOffsetPitch, -180.f, 180.f, "%.0f deg");

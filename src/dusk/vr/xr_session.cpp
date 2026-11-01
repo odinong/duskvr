@@ -130,7 +130,7 @@ std::array<XrSpace, 2> g_aimSpaces{};
 InputState g_input;
 
 // Blit pipelines, created on the render worker.
-enum class BlitKind { Copy, HudCompose, Cursor };
+enum class BlitKind { Copy, HudCompose, Cursor, Eye };
 struct BlitPipeline {
     BlitKind kind = BlitKind::Copy;
     wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
@@ -141,6 +141,9 @@ wgpu::Sampler g_blitSampler;
 wgpu::ShaderModule g_blitShader;
 wgpu::ShaderModule g_hudShader;
 wgpu::ShaderModule g_cursorShader;
+wgpu::ShaderModule g_eyeShader;
+wgpu::Buffer g_eyeParams;
+float g_vignette = 0.f;
 
 std::string result_string(XrResult res) {
     char buf[XR_MAX_RESULT_STRING_SIZE]{};
@@ -219,6 +222,51 @@ fn fs_srgb(in: VsOut) -> @location(0) vec4f {
 fn fs_unorm(in: VsOut) -> @location(0) vec4f {
     let c = textureSample(src, samp, in.uv);
     return vec4f(c.rgb, 1.0);
+}
+)";
+
+// Eye blit: the plain copy plus an optional comfort vignette.
+constexpr char kEyeShader[] = R"(
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var<uniform> params: vec4f;
+
+struct VsOut {
+    @builtin(position) pos: vec4f,
+    @location(0) uv: vec2f,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
+    var o: VsOut;
+    let uv = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+    o.pos = vec4f(uv * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0), 0.0, 1.0);
+    o.uv = uv;
+    return o;
+}
+
+fn to_linear(c: vec3f) -> vec3f {
+    let lo = c / 12.92;
+    let hi = pow((c + vec3f(0.055)) / 1.055, vec3f(2.4));
+    return select(hi, lo, c <= vec3f(0.04045));
+}
+
+fn vignette(uv: vec2f) -> f32 {
+    let d = length((uv - vec2f(0.5)) * 2.0);
+    let inner = mix(1.2, 0.35, params.x);
+    return 1.0 - smoothstep(inner, inner + 0.45, d) * min(params.x * 1.5, 1.0);
+}
+
+@fragment
+fn fs_srgb(in: VsOut) -> @location(0) vec4f {
+    let c = textureSample(src, samp, in.uv);
+    return vec4f(to_linear(c.rgb) * vignette(in.uv), 1.0);
+}
+
+@fragment
+fn fs_unorm(in: VsOut) -> @location(0) vec4f {
+    let c = textureSample(src, samp, in.uv);
+    return vec4f(c.rgb * vignette(in.uv), 1.0);
 }
 )";
 
@@ -326,6 +374,16 @@ const wgpu::RenderPipeline& blit_pipeline(
         const wgpu::ShaderModuleDescriptor cursorDesc{
             .nextInChain = &cursorWgsl, .label = "VR cursor"};
         g_cursorShader = device.CreateShaderModule(&cursorDesc);
+        wgpu::ShaderSourceWGSL eyeWgsl;
+        eyeWgsl.code = kEyeShader;
+        const wgpu::ShaderModuleDescriptor eyeDesc{.nextInChain = &eyeWgsl, .label = "VR eye"};
+        g_eyeShader = device.CreateShaderModule(&eyeDesc);
+        const wgpu::BufferDescriptor paramsDesc{
+            .label = "VR eye params",
+            .usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst,
+            .size = 16,
+        };
+        g_eyeParams = device.CreateBuffer(&paramsDesc);
         const wgpu::SamplerDescriptor samplerDesc{
             .label = "VR eye blit sampler",
             .magFilter = wgpu::FilterMode::Linear,
@@ -335,6 +393,7 @@ const wgpu::RenderPipeline& blit_pipeline(
     }
     const wgpu::ShaderModule& shader = kind == BlitKind::HudCompose ? g_hudShader :
                                        kind == BlitKind::Cursor     ? g_cursorShader :
+                                       kind == BlitKind::Eye        ? g_eyeShader :
                                                                       g_blitShader;
     const wgpu::ColorTargetState target{.format = format};
     const wgpu::FragmentState fragment{
@@ -968,6 +1027,10 @@ void shutdown() {
     }
     g_blitPipelines.clear();
     g_blitShader = {};
+    g_hudShader = {};
+    g_cursorShader = {};
+    g_eyeShader = {};
+    g_eyeParams = {};
     g_blitSampler = {};
 }
 
@@ -1101,7 +1164,8 @@ void render_eye(int index) {
     g_eyeRendered[index] = true;
 
     aurora::xr::set_next_frame_hook(
-        [target = sc.stagingTexture, memory = sc.stagingMemory, format = sc.format](
+        [target = sc.stagingTexture, memory = sc.stagingMemory, format = sc.format,
+            vignette = g_vignette](
             wgpu::CommandEncoder& encoder, const aurora::xr::PresentSource& source,
             std::vector<aurora::xr::AfterSubmitCallback>& afterSubmit) {
             const wgpu::Device device = aurora::xr::device();
@@ -1113,14 +1177,17 @@ void render_eye(int index) {
                 return;
             }
 
-            const auto& pipeline = blit_pipeline(device, format);
+            const auto& pipeline = blit_pipeline(device, format, BlitKind::Eye);
+            const float params[4] = {vignette, 0.f, 0.f, 0.f};
+            aurora::xr::queue().WriteBuffer(g_eyeParams, 0, params, sizeof(params));
             const wgpu::BindGroupEntry entries[] = {
                 {.binding = 0, .textureView = source.view},
                 {.binding = 1, .sampler = g_blitSampler},
+                {.binding = 2, .buffer = g_eyeParams, .size = 16},
             };
             const wgpu::BindGroupDescriptor bindDesc{
                 .layout = pipeline.GetBindGroupLayout(0),
-                .entryCount = 2,
+                .entryCount = 3,
                 .entries = entries,
             };
             const wgpu::BindGroup bindGroup = device.CreateBindGroup(&bindDesc);
@@ -1303,6 +1370,8 @@ void render_hud(int phase) {
             });
         });
 }
+
+void set_vignette(float amount) { g_vignette = std::clamp(amount, 0.f, 1.f); }
 
 void set_cursor(bool visible, const Pose& pose, float sizeMeters) {
     g_cursorVisible = visible;

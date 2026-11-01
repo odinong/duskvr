@@ -57,6 +57,30 @@ struct Pose {
     Vec3 right() const { return orientation.rotate({1.f, 0.f, 0.f}); }
 };
 
+inline Quat normalized(const Quat& q) {
+    const float l = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+    return l > 1e-6f ? Quat{q.x / l, q.y / l, q.z / l, q.w / l} : Quat{};
+}
+
+// Shortest rotation taking direction a onto direction b.
+inline Quat from_to(const Vec3& a, const Vec3& b) {
+    const Vec3 u = a.normalized();
+    const Vec3 v = b.normalized();
+    const float d = u.dot(v);
+    if (d > 0.99999f) {
+        return {};
+    }
+    if (d < -0.99999f) {
+        Vec3 axis = Vec3{1.f, 0.f, 0.f}.cross(u);
+        if (axis.length() < 1e-3f) {
+            axis = Vec3{0.f, 1.f, 0.f}.cross(u);
+        }
+        return Quat::axisAngle(axis.normalized(), 3.14159265358979f);
+    }
+    const Vec3 c = u.cross(v);
+    return normalized({c.x, c.y, c.z, 1.f + d});
+}
+
 // Yaw (radians) of a direction around +Y, measured so that yaw(0) looks down -Z.
 inline float yaw_of(const Vec3& dir) { return std::atan2(-dir.x, -dir.z); }
 

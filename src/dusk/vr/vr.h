@@ -53,6 +53,7 @@ bool apply_eye_view(view_class* view, float step);
 s16 control_angle_y(s16 gameCameraAngle);
 bool first_person();
 bool hide_link_body();
+bool hide_link_head();
 void override_link_hands(daAlink_c* link);
 bool hand_aim(s16& yaw, s16& pitch);
 
@@ -77,6 +78,7 @@ inline bool apply_eye_view(view_class*, float) { return false; }
 inline s16 control_angle_y(s16 a) { return a; }
 inline bool first_person() { return false; }
 inline bool hide_link_body() { return false; }
+inline bool hide_link_head() { return false; }
 inline void override_link_hands(daAlink_c*) {}
 inline bool hand_aim(s16&, s16&) { return false; }
 inline void draw_imgui_window(bool*) {}

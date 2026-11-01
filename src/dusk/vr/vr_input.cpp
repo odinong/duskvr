@@ -35,6 +35,8 @@ struct Latched {
     bool thrust = false;
     bool spin = false;
     bool bash = false;
+    bool dig = false;   // wolf: A
+    bool spur = false;  // horse: A
 };
 
 Latched g_latched;
@@ -53,6 +55,19 @@ float g_recenterHeld = 0.f;
 bool g_prevStickClick = false;
 
 xr::InputState g_lastInput;
+
+// Body-driven locomotion.
+Vec3 g_prevHead;
+bool g_prevHeadValid = false;
+float g_lungeCooldown = 0.f;
+float g_digCooldown = 0.f;
+float g_spurCooldown = 0.f;
+bool g_climbActive = false;
+float g_climbX = 0.f, g_climbY = 0.f;
+float g_swimDrive = 0.f;
+Vec3 g_prevGrip[2];
+bool g_prevGripValid[2]{};
+Vec3 g_handVelocity[2];
 
 // Physical bow: the off hand holds the bow, the sword hand grabs the string near it and pulls.
 constexpr float kNockDistance = 0.22f;  // meters between the hands to grab the string
@@ -80,14 +95,15 @@ Vec3 to_head_frame(const Vec3& v, const Pose& head) {
     return heading_only(head.orientation).conjugate().rotate(v);
 }
 
-void detect_sword(const xr::HandState& hand, const Pose& head, float dt, const Context& ctx) {
+void detect_sword(const xr::HandState& hand, const Pose& head, float dt, const Context& ctx,
+    float reach = kSwordLength) {
     g_swingCooldown = std::max(0.f, g_swingCooldown - dt);
     if (!hand.active || dt <= 0.f) {
         g_prevTipValid = false;
         return;
     }
 
-    const Vec3 tip = hand.grip.position + hand.grip.forward() * kSwordLength;
+    const Vec3 tip = hand.grip.position + hand.grip.forward() * reach;
     Vec3 tipVelocity;
     if (g_prevTipValid) {
         tipVelocity = (tip - g_prevTip) * (1.f / dt);
@@ -194,6 +210,108 @@ void update_bow(const xr::InputState& in, float dt, const Context& ctx) {
     }
 }
 
+// Hand velocities from the runtime when it reports them, else from motion between frames.
+void update_hand_velocities(const xr::InputState& in, float dt) {
+    for (int h = 0; h < 2; ++h) {
+        const auto& hand = in.hands[h];
+        if (!hand.active) {
+            g_prevGripValid[h] = false;
+            g_handVelocity[h] = {};
+            continue;
+        }
+        if (hand.velocityValid) {
+            g_handVelocity[h] = hand.velocity;
+        } else if (g_prevGripValid[h] && dt > 0.f) {
+            g_handVelocity[h] = (hand.grip.position - g_prevGrip[h]) * (1.f / dt);
+        }
+        g_prevGrip[h] = hand.grip.position;
+        g_prevGripValid[h] = true;
+    }
+}
+
+// Wolf Link: swipe a controller to claw, lunge your head forward to bite, dig with both hands low
+// and moving.
+void detect_wolf(const xr::InputState& in, const Pose& head, float dt, const Context& ctx) {
+    detect_sword(in.hands[sword_hand()], head, dt, ctx, 0.15f);
+
+    g_lungeCooldown = std::max(0.f, g_lungeCooldown - dt);
+    if (g_prevHeadValid && dt > 0.f && g_lungeCooldown <= 0.f) {
+        const Vec3 v = to_head_frame((head.position - g_prevHead) * (1.f / dt), head);
+        if (-v.z > 1.3f) {
+            g_latched.swing = true;
+            g_lungeCooldown = 0.4f;
+            xr::haptic(xr::kLeft, 0.5f, 0.05f);
+            xr::haptic(xr::kRight, 0.5f, 0.05f);
+        }
+    }
+
+    g_digCooldown = std::max(0.f, g_digCooldown - dt);
+    const auto& l = in.hands[xr::kLeft];
+    const auto& r = in.hands[xr::kRight];
+    if (l.active && r.active && g_digCooldown <= 0.f) {
+        const float low = -0.85f;  // meters below the eyes
+        const bool handsLow = l.grip.position.y - head.position.y < low &&
+                              r.grip.position.y - head.position.y < low;
+        const float speed =
+            0.5f * (g_handVelocity[xr::kLeft].length() + g_handVelocity[xr::kRight].length());
+        if (handsLow && speed > 0.9f) {
+            g_latched.dig = true;
+            g_digCooldown = 0.5f;
+            xr::haptic(xr::kLeft, 0.4f, 0.04f);
+            xr::haptic(xr::kRight, 0.4f, 0.04f);
+        }
+    }
+}
+
+// Ladders, vines, ledges and ceilings: grab with either hand and pull. Pulling down (or toward
+// you, hanging from a ceiling) climbs forward; sideways pulls move sideways.
+void update_climb(const xr::InputState& in, const Pose& head) {
+    float sx = 0.f, sy = 0.f;
+    int grabbing = 0;
+    for (int h = 0; h < 2; ++h) {
+        if (!in.hands[h].active || in.squeeze[h] < 0.5f) {
+            continue;
+        }
+        const Vec3 v = to_head_frame(g_handVelocity[h], head);
+        sy += -v.y + v.z;
+        sx += -v.x;
+        ++grabbing;
+    }
+    g_climbActive = grabbing > 0;
+    const float targetX = grabbing > 0 ? std::clamp(sx / grabbing / 0.5f, -1.f, 1.f) : 0.f;
+    const float targetY = grabbing > 0 ? std::clamp(sy / grabbing / 0.5f, -1.f, 1.f) : 0.f;
+    g_climbX += (targetX - g_climbX) * 0.3f;
+    g_climbY += (targetY - g_climbY) * 0.3f;
+}
+
+// Swimming: breaststroke. Sweeping both hands backward pushes you forward.
+void update_swim(const xr::InputState& in, const Pose& head, float dt) {
+    g_swimDrive = std::max(0.f, g_swimDrive - dt * 0.8f);
+    if (!in.hands[xr::kLeft].active || !in.hands[xr::kRight].active) {
+        return;
+    }
+    const Vec3 l = to_head_frame(g_handVelocity[xr::kLeft], head);
+    const Vec3 r = to_head_frame(g_handVelocity[xr::kRight], head);
+    const float back = 0.5f * (l.z + r.z);
+    if (back > 0.4f) {
+        g_swimDrive = std::max(g_swimDrive, std::clamp((back - 0.2f) / 1.2f, 0.f, 1.f));
+    }
+}
+
+// Riding: flick both hands down together, like snapping the reins, to spur Epona.
+void detect_reins(const xr::InputState& in, float dt) {
+    g_spurCooldown = std::max(0.f, g_spurCooldown - dt);
+    if (g_spurCooldown > 0.f || !in.hands[xr::kLeft].active || !in.hands[xr::kRight].active) {
+        return;
+    }
+    if (g_handVelocity[xr::kLeft].y < -1.4f && g_handVelocity[xr::kRight].y < -1.4f) {
+        g_latched.spur = true;
+        g_spurCooldown = 0.7f;
+        xr::haptic(xr::kLeft, 0.6f, 0.06f);
+        xr::haptic(xr::kRight, 0.6f, 0.06f);
+    }
+}
+
 void queue_spin() {
     // Quick spin: a full stick rotation followed by B.
     g_macro.clear();
@@ -261,9 +379,30 @@ FrameResult update_frame(const xr::InputState& in, const Pose& head, float dt, c
     }
     g_prevStickClick = in.stickClick[s];
 
+    update_hand_velocities(in, dt);
     if (ctx.gameplay && getSettings().vr.motionControls) {
         update_bow(in, dt, ctx);
-        if (ctx.bowReady) {
+        if (ctx.climbing) {
+            update_climb(in, head);
+        } else {
+            g_climbActive = false;
+        }
+        if (ctx.swimming) {
+            update_swim(in, head, dt);
+        } else {
+            g_swimDrive = 0.f;
+        }
+        if (ctx.riding) {
+            detect_reins(in, dt);
+        }
+        if (ctx.wolf) {
+            detect_wolf(in, head, dt, ctx);
+            g_shieldUp = false;
+        } else if (ctx.climbing || ctx.swimming) {
+            // Hands are busy climbing or swimming.
+            g_prevTipValid = false;
+            g_shieldUp = false;
+        } else if (ctx.bowReady) {
             // Pulling a bowstring is not a sword swing, and the bow arm isn't a shield.
             g_prevTipValid = false;
             g_shieldUp = false;
@@ -277,8 +416,18 @@ FrameResult update_frame(const xr::InputState& in, const Pose& head, float dt, c
         g_bowDrawing = false;
     }
 
-    g_crouching = ctx.gameplay && getSettings().vr.physicalCrouch && ctx.standingHeight > 0.5f &&
-                  head.position.y < ctx.standingHeight * kCrouchRatio;
+    g_crouching = ctx.gameplay && !ctx.wolf && getSettings().vr.physicalCrouch &&
+                  ctx.standingHeight > 0.5f && head.position.y < ctx.standingHeight * kCrouchRatio;
+    g_prevHead = head.position;
+    g_prevHeadValid = true;
+
+    // How much the view is being moved artificially, for the comfort vignette.
+    const int o = shield_hand();
+    const float stick = std::min(1.f, std::hypot(deadzone(in.stickX[o]), deadzone(in.stickY[o])));
+    const float smoothTurn = getSettings().vr.turnMode.getValue() == 1 ? std::fabs(turnX) : 0.f;
+    result.motion = ctx.gameplay ? std::max({stick, smoothTurn, g_climbActive ? 0.5f : 0.f,
+                                       g_swimDrive, ctx.riding ? 0.6f : 0.f}) :
+                                   0.f;
     return result;
 }
 
@@ -318,6 +467,20 @@ void sync_virtual_pad(const Context& ctx) {
 
     if (ctx.gameplay && g_bowDrawing) {
         buttons |= ctx.bowSlot == 1 ? PAD_BUTTON_Y : PAD_BUTTON_X;
+    }
+
+    if (ctx.gameplay && getSettings().vr.motionControls) {
+        const bool stickIdle = status.stickX == 0 && status.stickY == 0;
+        if (ctx.climbing && g_climbActive && stickIdle) {
+            status.stickX = to_stick(g_climbX);
+            status.stickY = to_stick(g_climbY);
+        }
+        if (ctx.swimming && g_swimDrive > 0.05f && stickIdle) {
+            status.stickY = to_stick(g_swimDrive);
+        }
+        if (g_latched.dig || g_latched.spur) {
+            buttons |= PAD_BUTTON_A;
+        }
     }
 
     if (ctx.gameplay) {

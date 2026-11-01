@@ -19727,7 +19727,7 @@ int daAlink_c::draw() {
 
         BOOL var_r3 = isPlayerNoDraw || dComIfGp_checkCameraAttentionStatus(field_0x317c, 0x20);
         // VR first person: no head (it would fill the view) and no sheath on the hidden back.
-        BOOL headNoDraw = var_r3 IF_DUSK(|| dusk::vr::hide_link_body());
+        BOOL headNoDraw = var_r3 IF_DUSK(|| dusk::vr::hide_link_head());
 
         modelDraw(mpLinkHatModel, headNoDraw);
 

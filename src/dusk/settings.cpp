@@ -214,6 +214,8 @@ UserSettings g_userSettings = {
         .hudWidth {"vr.hudWidth", 1.5f},
         .hudHeight {"vr.hudHeight", -0.1f},
         .mirror {"vr.mirror", 0},
+        .fullBody {"vr.fullBody", true},
+        .comfortVignette {"vr.comfortVignette", false},
     },
 
     // Not sure if there's a better way to declare this
@@ -451,6 +453,8 @@ void registerSettings() {
     Register(g_userSettings.vr.hudWidth);
     Register(g_userSettings.vr.hudHeight);
     Register(g_userSettings.vr.mirror);
+    Register(g_userSettings.vr.fullBody);
+    Register(g_userSettings.vr.comfortVignette);
     Register(g_userSettings.backend.isoVerification);
     Register(g_userSettings.backend.graphicsBackend);
     Register(g_userSettings.backend.skipPreLaunchUI);

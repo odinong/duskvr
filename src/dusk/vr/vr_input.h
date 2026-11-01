@@ -6,6 +6,7 @@ namespace dusk::vr::input {
 
 struct FrameResult {
     float turnRad = 0.f;    // play-space yaw change requested this frame
+    float motion = 0.f;     // 0..1, how much artificial movement is happening (comfort vignette)
     bool recenter = false;
     bool toggleView = false;
 };
@@ -17,6 +18,10 @@ struct Context {
     float standingHeight = 0;  // head height at recenter, meters
     bool bowReady = false;     // bow or slingshot out and aimed
     int bowSlot = 0;           // item slot the bow is on (0 = X, 1 = Y)
+    bool wolf = false;
+    bool climbing = false;     // ladder, vines, ledge or ceiling
+    bool swimming = false;
+    bool riding = false;       // on Epona
 };
 
 // Runs every headset frame: turning, view toggles and gesture detection. Gestures are latched until

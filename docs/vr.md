@@ -1,8 +1,9 @@
 # Dusklight VR
 
-Full 6DoF OpenXR support, built into the engine: the game renders each eye itself, first person at
-Link's eyes with a third-person toggle, the HUD and menus on a floating panel you point at, and
-motion controls for the sword, shield, bow and aiming.
+Full 6DoF OpenXR support, built into the engine: the game renders each eye itself, first person
+inside Link's full body (arms reaching for your controllers, legs walking), Wolf Link on all fours,
+a third-person toggle, the HUD and menus on a floating panel you point at, and motion controls for
+the sword, shield, bow, climbing, swimming and riding.
 
 ## Requirements
 
@@ -48,7 +49,15 @@ The sword hand is the right controller by default (Settings: left handed).
 | Off-hand trigger / grip | L (lock on) / R |
 | Menu | Start |
 
-Room scale is on by default: walking in your room moves Link, and walls stop you.
+| Wolf: swipe a controller / lunge your head forward | Claw / bite (B) |
+| Wolf: both hands low, scrabbling | Dig (A) |
+| Ladder, vines, ledge, ceiling: hold grip and pull | Climb (pull down to go up, sideways to shuffle) |
+| Swimming: sweep both arms back | Swim forward |
+| On Epona: flick both hands down | Spur (A) |
+
+Room scale is on by default: walking in your room moves Link, and walls stop you. Standing still,
+Link's body turns to face where you look once you look far enough away, pivoting around his eyes so
+the view never swings.
 
 The controllers vibrate when the sword connects, when you get hurt, while drawing the bow (rising
 tension) and when you raise the shield.
@@ -61,10 +70,26 @@ turning, hand-oriented movement, room scale, physical crouch, motion controls, s
 sword and shield angle offsets, what the desktop window mirrors, resolution scale and recenter.
 Any of them can also be set for one run with `--cvar`, e.g. `--cvar vr.mirror=1`.
 
+The comfort vignette (off by default) darkens the edges of your view while the stick, smooth
+turning, climbing, swimming or riding moves you.
+
+### Body
+
+In first person you are inside Link's body: looking down you see your chest, arms and legs, and his
+shadow moves with you. Only the head and neck are left out of your own view. Each controller drives
+the arm on its side through two-bone IK (elbows hang down and out like a relaxed arm), the skin at
+the elbows and shoulders follows, and the legs keep the game's walking and running animations.
+Turn the body off ("Full body" in Tools > VR) for floating hands only.
+
+Link holds the sword in your sword hand: in VR the game's sword and shield attachment points follow
+the "Left handed" setting.
+
+As Wolf Link the camera sits at the wolf's eyes and you see his body and paws below you (and Midna
+on your back, when she rides).
+
 ### Hands
 
-In first person Link's body and head are hidden; his hands, and whatever they hold, follow your
-controllers. The controller holds the item joint the game attaches weapons to, oriented so the
+His hands, and whatever they hold, follow your controllers. The controller holds the item joint the game attaches weapons to, oriented so the
 blade points along the controller like a held sword. Everything held is moved to the controller's
 pose again at draw time, so hands track at the headset's refresh rate rather than the game's 30 Hz.
 If a weapon sits at an odd angle in your grip, the sword / shield pitch, yaw and roll offsets in
@@ -108,5 +133,7 @@ the trigger clicks.
   hitbox (which follows your controller) is live while that attack runs.
 - 2D markers that point at things in the world (lock-on arrows) sit on the HUD panel where the flat
   game would draw them, not over the target.
-- Wolf Link in first person has no visible paws.
+- The arms don't twist the forearm to follow wrist roll; extreme wrist angles can look stiff.
+- Wolf Link, climbing, swimming and riding gestures were written against the game's code but not yet
+  playtested.
 - Only tested on SteamVR with a Valve Index; other runtimes should work through OpenXR.
