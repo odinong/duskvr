@@ -19622,7 +19622,7 @@ int daAlink_c::draw() {
 
     if (checkWolf()) {
         dComIfGd_setListDark();
-        modelDraw(mpLinkModel, isPlayerNoDraw IF_DUSK(|| dusk::vr::hide_link_body()));
+        modelDraw(mpLinkModel, isPlayerNoDraw);
 
         if (dComIfGs_isEventBit(dSv_event_flag_c::M_011)) {
             for (int i = 0; i < 4; i++) {
@@ -19682,7 +19682,7 @@ int daAlink_c::draw() {
             }
         }
 
-        modelDraw(mpLinkModel, isPlayerNoDraw IF_DUSK(|| dusk::vr::hide_link_body()));
+        modelDraw(mpLinkModel, isPlayerNoDraw);
 
         if (dComIfGp_checkCameraAttentionStatus(field_0x317c, 0x20)) {
 #if PLATFORM_SHIELD
@@ -19730,8 +19730,8 @@ int daAlink_c::draw() {
         }
 
         BOOL var_r3 = isPlayerNoDraw || dComIfGp_checkCameraAttentionStatus(field_0x317c, 0x20);
-        // VR first person: no head (it would fill the view) and no sheath on the hidden back.
-        BOOL headNoDraw = var_r3 IF_DUSK(|| dusk::vr::hide_link_head());
+        // VR hides the head per frame (dusk::vr), since these lists also feed the spectator view.
+        BOOL headNoDraw = var_r3;
 
         modelDraw(mpLinkHatModel, headNoDraw);
 

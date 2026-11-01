@@ -55,7 +55,8 @@ bool floor_relative();
 // Darkens the edges of the eye views (0 = off, 1 = strong), for comfort while moving.
 void set_vignette(float amount);
 // Queues the blit of the next aurora frame's output into this eye's swapchain image.
-void render_eye(int index);
+// With desktopCrop, the frame is also turned into a 16:9 band of itself, for the desktop window.
+void render_eye(int index, bool desktopCrop = false);
 // HUD panel: phase 0 keeps the next aurora frame (HUD over black), phase 1 composes it with the
 // next frame (HUD over white) into the panel's swapchain.
 void render_hud(int phase);

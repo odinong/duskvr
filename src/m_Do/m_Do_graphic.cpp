@@ -2201,11 +2201,15 @@ int mDoGph_Painter() {
     // VR draws the 3D scene once per eye and the 2D HUD separately onto a floating panel. The HUD
     // is drawn over black and over white to recover its alpha.
     const dusk::vr::Pass vrPass = dusk::vr::render_pass();
-    const bool vrEyePass = vrPass == dusk::vr::Pass::Eye;
+    // The spectator view is drawn like an eye, plus (optionally) the HUD.
+    const bool vrEyePass = vrPass == dusk::vr::Pass::Eye ||
+                           (vrPass == dusk::vr::Pass::Spectator && !dusk::vr::spectator_hud());
     const bool vrHudPass = vrPass == dusk::vr::Pass::HudBlack || vrPass == dusk::vr::Pass::HudWhite;
+    const bool vrAnyPass = vrPass != dusk::vr::Pass::Flat;
 #else
     const bool vrEyePass = false;
     const bool vrHudPass = false;
+    const bool vrAnyPass = false;
 #endif
 
     JFWDisplay::getManager()->setFader(mDoGph_gInf_c::getFader());
@@ -2691,7 +2695,7 @@ int mDoGph_Painter() {
                 }
 
                 // Letterbox bars make no sense in a headset.
-                if (!vrEyePass) {
+                if (!vrAnyPass) {
                     trimming(&camera_p->view, view_port);
                 }
 
@@ -2715,7 +2719,7 @@ int mDoGph_Painter() {
 
     #if TARGET_PC
     if (dusk::getSettings().game.enableMirrorMode && dComIfGp_getWindowNum() != 0 &&
-        !vrEyePass && !vrHudPass)
+        !vrAnyPass)
     #elif PLATFORM_WII
     if (data_8053a730)
     #endif

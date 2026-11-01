@@ -257,6 +257,14 @@ static void run_vr_frame() {
             aurora_end_frame();
         }
     }
+    if (eyes > 0 && dusk::vr::spectator_pending() && aurora_begin_frame()) {
+        dusk::vr::begin_spectator();
+        dusk::interp::begin_presentation(step);
+        fpcM_DrawIterater((fpcM_DrawIteraterFunc)fpcM_Draw);
+        cAPIGph_Painter();
+        dusk::interp::end_presentation();
+        aurora_end_frame();
+    }
     dusk::vr::end_frame();
 }
 

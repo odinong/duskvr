@@ -32,6 +32,9 @@
 #include <cmath>
 
 namespace dusk::vr {
+
+bool desktop_fill();
+
 namespace {
 
 constexpr borealis::Log Log{"vr"};
@@ -65,7 +68,7 @@ struct HandPlacement {
 HandPlacement g_placements[2];
 
 void latch_hands(daAlink_c* link, float step);
-void hide_head(J3DModel* model);
+void hide_head(daAlink_c* link);
 
 // A joint's rest (bind) pose in model space: the inverse of its stored inverse bind matrix.
 void bind_matrix(J3DModelData* data, int joint, Mtx out) {
@@ -125,6 +128,14 @@ bool g_swimming = false;
 bool g_riding = false;
 bool g_bodyTurning = false;
 bool g_stepping = false;
+
+// Spectator (desktop) camera.
+uint32_t g_frameCounter = 0;
+float g_headsetFps = 0.f;
+bool g_specValid = false;
+Quat g_specRot;
+Vec3 g_specPos;
+double g_specLastTime = 0.0;
 
 // You can lean and look around this far (meters) before Link's feet step to stay under you.
 constexpr float kLeanRadius = 0.3f;
@@ -453,6 +464,23 @@ bool begin_frame() {
         return false;
     }
     g_frameOpen = true;
+    ++g_frameCounter;
+    {
+        static double windowStart = 0.0;
+        static uint32_t windowFrames = 0;
+        const double t = xr::predicted_display_seconds();
+        ++windowFrames;
+        if (windowStart <= 0.0) {
+            windowStart = t;
+        } else if (t - windowStart >= 2.0) {
+            g_headsetFps = static_cast<float>(windowFrames / (t - windowStart));
+            if (std::getenv("DUSK_VR_DEBUG_PERF") != nullptr) {
+                Log.info("headset {:.1f} fps", g_headsetFps);
+            }
+            windowStart = t;
+            windowFrames = 0;
+        }
+    }
 
     const double now = xr::predicted_display_seconds();
     const float dt = g_lastDisplayTime > 0.0 ?
@@ -506,10 +534,17 @@ int eye_count() { return g_frameOpen && xr::views_valid() ? 2 : 0; }
 void begin_eye(int eye) {
     g_pass = Pass::Eye;
     g_currentEye = eye;
-    xr::render_eye(eye);
-    // Mirror the last eye to the desktop window; never block on the window's vsync.
-    aurora::xr::set_next_frame_window_present(eye == 1 && getSettings().vr.mirror.getValue() == 0);
+    const int desktop = getSettings().vr.desktopView.getValue();
+    const bool crop = eye == 1 && desktop == 0;
+    xr::render_eye(eye, crop);
+    // The desktop window shows the right eye (16:9 band, or raw); never block on its vsync.
+    aurora::xr::set_next_frame_window_present(eye == 1 && (desktop == 0 || desktop == 4));
+    aurora::xr::set_next_frame_present_fill(desktop_fill());
 }
+
+// Every aurora frame in a VR frame must agree on the window layout, or the UI overlay re-lays
+// itself out for each one.
+bool desktop_fill() { return getSettings().vr.desktopView.getValue() <= 3; }
 
 bool hud_pending() { return g_hudPending; }
 
@@ -517,13 +552,31 @@ void begin_hud(int phase) {
     g_pass = phase == 0 ? Pass::HudBlack : Pass::HudWhite;
     g_currentEye = -1;
     xr::render_hud(phase);
-    aurora::xr::set_next_frame_window_present(phase != 0 && getSettings().vr.mirror.getValue() == 1);
+    aurora::xr::set_next_frame_window_present(
+        phase != 0 && getSettings().vr.desktopView.getValue() == 5);
+    aurora::xr::set_next_frame_present_fill(desktop_fill());
     if (phase != 0) {
         g_hudPending = false;
     }
 }
 
 Pass render_pass() { return g_pass; }
+
+bool spectator_pending() {
+    const int view = getSettings().vr.desktopView.getValue();
+    const int rate = std::clamp(getSettings().vr.spectatorRate.getValue(), 1, 8);
+    return view >= 1 && view <= 3 && g_frameCounter % rate == 0;
+}
+
+void begin_spectator() {
+    g_pass = Pass::Spectator;
+    g_currentEye = -1;
+    aurora::xr::set_next_frame_window_present(true);
+    // Drawn 16:9 into the eye-shaped framebuffer; stretching it over the window undoes that.
+    aurora::xr::set_next_frame_present_fill(desktop_fill());
+}
+
+bool spectator_hud() { return getSettings().vr.spectatorHud; }
 
 bool next_frame_clear(u8& level) {
     // Frame order: eye 0, eye 1, then (after a sim tick) HUD over black, HUD over white.
@@ -713,6 +766,14 @@ void after_sim_tick() {
         bool& dumped = link->checkWolf() ? dumpedWolf : dumpedHuman;
         if (!dumped) {
             dump_skeleton(link->mpLinkModel, link->checkWolf() ? "wolf" : "human");
+            if (!link->checkWolf() && link->mpLinkHandModel != nullptr) {
+                J3DModelData* hands = link->mpLinkHandModel->getModelData();
+                for (u16 i = 0; i < hands->getMaterialNum(); ++i) {
+                    Log.info("hand material {} '{}' joint {}", i,
+                        hands->getMaterialName() ? hands->getMaterialName()->getName(i) : "?",
+                        hands->getMaterialNodePointer(i)->getJoint()->getJntNo());
+                }
+            }
             dumped = true;
         }
     }
@@ -752,7 +813,114 @@ void after_sim_tick() {
     g_linkValid = true;
 }
 
+namespace {
+
+// Fills in everything the game derives from a camera pose. The projection must already be set.
+void finish_view(view_class* view, const Quat& rot, const Vec3& pos, float fovy, float aspect) {
+    build_view_matrix(view->viewMtx, rot, pos);
+    const Vec3 fwd = rot.rotate({0.f, 0.f, -1.f});
+    const Vec3 up = rot.rotate({0.f, 1.f, 0.f});
+    view->lookat.eye = to_cxyz(pos);
+    view->lookat.center = to_cxyz(pos + fwd * 100.f);
+    view->lookat.up = to_cxyz(up);
+    view->bank = 0;
+    view->fovy = fovy;
+    view->aspect = aspect;
+
+    j3dSys.setViewMtx(view->viewMtx);
+    cMtx_inverse(view->viewMtx, view->invViewMtx);
+    MTXCopy(view->viewMtx, view->viewMtxNoTrans);
+    view->viewMtxNoTrans[0][3] = 0.0f;
+    view->viewMtxNoTrans[1][3] = 0.0f;
+    view->viewMtxNoTrans[2][3] = 0.0f;
+    cMtx_concatProjView(view->projMtx, view->viewMtx, view->projViewMtx);
+    mDoLib_clipper::setup(fovy + 10.f, aspect, view->near_, view->far_);
+}
+
+// Heading and pitch only: a streamer's camera never rolls.
+Quat level_rotation(const Vec3& fwd) {
+    const float pitch = std::asin(std::clamp(fwd.y, -1.f, 1.f));
+    return Quat::yaw(yaw_of(fwd)) * Quat::axisAngle({1.f, 0.f, 0.f}, pitch);
+}
+
+Quat nlerp(const Quat& a, const Quat& b, float t) {
+    const float dot = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    const float s = dot < 0.f ? -1.f : 1.f;
+    return normalized({a.x + (b.x * s - a.x) * t, a.y + (b.y * s - a.y) * t,
+        a.z + (b.z * s - a.z) * t, a.w + (b.w * s - a.w) * t});
+}
+
+// The desktop's 16:9 camera, LIV style: a smoothed first-person view, the game's own (collision-
+// aware) third-person camera showing your whole body, or a selfie camera in front of you.
+bool apply_spectator_view(view_class* view, float step) {
+    constexpr float kAspect = 16.f / 9.f;
+    const int mode = getSettings().vr.desktopView.getValue() - 1;  // 0 smooth, 1 third person, 2 selfie
+    const float scale = units_per_meter();
+    const double now = xr::predicted_display_seconds();
+    const float dt = g_specLastTime > 0.0 ? static_cast<float>(std::clamp(now - g_specLastTime, 0.0, 0.2)) : 0.f;
+    g_specLastTime = now;
+
+    if (g_firstPersonFrame && getSettings().vr.motionControls) {
+        if (daAlink_c* link = get_link(); link != nullptr && !link->checkWolf()) {
+            latch_hands(link, step);
+        }
+    }
+
+    float fovy = std::clamp(getSettings().vr.spectatorFov.getValue(), 30.f, 120.f);
+    Vec3 pos;
+    Quat rot;
+    if (mode == 1 || !xr::head_valid()) {
+        // The game camera, as interpolated for this frame.
+        pos = to_vec(view->lookat.eye);
+        rot = level_rotation((to_vec(view->lookat.center) - pos).normalized());
+        fovy = view->fovy;
+    } else {
+        const Pose& head = xr::head();
+        Vec3 eye;
+        Quat look;
+        if (g_firstPersonFrame) {
+            eye = tracking_to_world_fp(head.position, interpolated_anchor(step));
+            look = Quat::yaw(g_yawOffset) * head.orientation;
+        } else {
+            const float base = game_camera_yaw(view) - g_headYawAtRecenter;
+            eye = to_vec(view->lookat.eye) + Quat::yaw(base).rotate(head.position - g_body) * scale;
+            look = Quat::yaw(base) * head.orientation;
+        }
+        const Vec3 fwd = look.rotate({0.f, 0.f, -1.f});
+        if (mode == 0) {
+            // Your view, turning, tilting and rolling with your head (or kept level, if chosen).
+            pos = eye;
+            rot = getSettings().vr.spectatorLevel ? level_rotation(fwd) : look;
+        } else {
+            // Selfie: in front of you, looking back at your face.
+            const Vec3 flat = Vec3{fwd.x, 0.f, fwd.z}.normalized();
+            pos = eye + flat * (1.6f * scale) + Vec3{0.f, 0.15f * scale, 0.f};
+            rot = level_rotation((eye - pos).normalized());
+        }
+        // Take the edge off head jitter without lagging behind: at 0 smoothing the view follows
+        // the headset exactly.
+        const float smoothing = std::clamp(getSettings().vr.spectatorSmoothing.getValue(), 0.f, 1.f);
+        const float rate = 40.f - 36.f * smoothing;  // per second
+        const float k = g_specValid && smoothing > 0.f ? 1.f - std::exp(-dt * rate) : 1.f;
+        g_specRot = nlerp(g_specRot, rot, k);
+        g_specPos = g_specValid ? g_specPos + (pos - g_specPos) * std::min(1.f, k * 1.5f) : pos;
+        g_specValid = true;
+        rot = g_specRot;
+        pos = g_specPos;
+    }
+
+    view->near_ = std::max(view->near_, 1.f);
+    C_MTXPerspective(view->projMtx, fovy, kAspect, view->near_, view->far_);
+    finish_view(view, rot, pos, fovy, kAspect);
+    return true;
+}
+
+}  // namespace
+
 bool apply_eye_view(view_class* view, float step) {
+    if (g_active && g_pass == Pass::Spectator && view != nullptr) {
+        return apply_spectator_view(view, step);
+    }
     if (!g_active || g_currentEye < 0 || view == nullptr) {
         return false;
     }
@@ -777,20 +945,12 @@ bool apply_eye_view(view_class* view, float step) {
     if (g_firstPersonFrame) {
         if (daAlink_c* link = get_link(); link != nullptr && link->mpLinkModel != nullptr) {
             // You are inside Link's head: only your own eyes skip drawing it.
-            hide_head(link->mpLinkModel);
+            hide_head(link);
             if (!link->checkWolf() && getSettings().vr.motionControls) {
                 latch_hands(link, step);
             }
         }
     }
-
-    build_view_matrix(view->viewMtx, eyeRot, eyePos);
-    const Vec3 fwd = eyeRot.rotate({0.f, 0.f, -1.f});
-    const Vec3 up = eyeRot.rotate({0.f, 1.f, 0.f});
-    view->lookat.eye = to_cxyz(eyePos);
-    view->lookat.center = to_cxyz(eyePos + fwd * 100.f);
-    view->lookat.up = to_cxyz(up);
-    view->bank = 0;
 
     const float n = std::max(view->near_, 1.f);
     const float f = view->far_;
@@ -801,18 +961,8 @@ bool apply_eye_view(view_class* view, float step) {
     // The clipper only understands symmetric frusta; cover the whole asymmetric one.
     const float halfV = std::max(std::fabs(tu), std::fabs(td));
     const float halfH = std::max(std::fabs(tl), std::fabs(tr));
-    view->fovy = 2.f * std::atan(halfV) * (180.f / kPi);
-    view->aspect = halfH / halfV;
     view->near_ = n;
-
-    j3dSys.setViewMtx(view->viewMtx);
-    cMtx_inverse(view->viewMtx, view->invViewMtx);
-    MTXCopy(view->viewMtx, view->viewMtxNoTrans);
-    view->viewMtxNoTrans[0][3] = 0.0f;
-    view->viewMtxNoTrans[1][3] = 0.0f;
-    view->viewMtxNoTrans[2][3] = 0.0f;
-    cMtx_concatProjView(view->projMtx, view->viewMtx, view->projViewMtx);
-    mDoLib_clipper::setup(view->fovy + 10.f, view->aspect, n, f);
+    finish_view(view, eyeRot, eyePos, 2.f * std::atan(halfV) * (180.f / kPi), halfH / halfV);
 
     if (g_currentEye == 0) {
         Z2GetAudience()->setAudioCamera(view->viewMtx, view->lookat.eye, view->lookat.center,
@@ -848,9 +998,12 @@ s16 control_angle_y(s16 gameCameraAngle) {
 
 bool first_person() { return g_active && g_firstPersonFrame; }
 
-bool hide_link_body() { return first_person() && !getSettings().vr.fullBody; }
+// The spectator camera shows all of Link; only your own eyes leave out what's in the way.
+bool hide_link_body() {
+    return first_person() && g_pass != Pass::Spectator && !getSettings().vr.fullBody;
+}
 
-bool hide_link_head() { return first_person(); }
+bool hide_link_head() { return first_person() && g_pass != Pass::Spectator; }
 
 namespace {
 
@@ -1323,7 +1476,41 @@ void latch_hands(daAlink_c* link, float step) {
     latch(xr::kRight);
 }
 
-void hide_head(J3DModel* model) {
+void collapse(MtxP m) {
+    Mtx collapsed{};
+    collapsed[0][3] = m[0][3];
+    collapsed[1][3] = m[1][3];
+    collapsed[2][3] = m[2][3];
+    interp::set_presentation_override(m, collapsed);
+}
+
+void collapse_model(J3DModel* model) {
+    if (model == nullptr) {
+        return;
+    }
+    J3DModelData* data = model->getModelData();
+    for (u16 i = 0; i < data->getJointNum(); ++i) {
+        collapse(model->getAnmMtx(i));
+    }
+    for (u16 i = 0; i < data->getWEvlpMtxNum(); ++i) {
+        collapse(model->getWeightAnmMtx(i));
+    }
+}
+
+// For the current eye frame only, shrinks Link's head (and his face and hat models) to nothing.
+// His draw lists are built once per sim tick and also feed the spectator view, so the head is
+// hidden here rather than left out of them.
+void hide_head(daAlink_c* link) {
+    J3DModel* model = link->mpLinkModel;
+    if (!getSettings().vr.fullBody) {
+        collapse_model(model);
+    }
+    if (!link->checkWolf()) {
+        collapse_model(link->mpLinkFaceModel);
+        collapse_model(link->mpLinkHatModel);
+        collapse_model(link->mpDemoFCBlendModel);
+        collapse_model(link->mpDemoFCTongueModel);
+    }
     // Collapse the neck too (the head's parent), or you look down into the collar.
     J3DModelData* data = model->getModelData();
     int root = kHeadJoint;
@@ -1337,12 +1524,7 @@ void hide_head(J3DModel* model) {
     static std::vector<u16> joints;
     collect_subtree(data, root, joints);
     for (u16 j : joints) {
-        MtxP m = model->getAnmMtx(j);
-        Mtx collapsed{};
-        collapsed[0][3] = m[0][3];
-        collapsed[1][3] = m[1][3];
-        collapsed[2][3] = m[2][3];
-        interp::set_presentation_override(m, collapsed);
+        collapse(model->getAnmMtx(j));
     }
 }
 
@@ -1411,6 +1593,7 @@ void draw_imgui_window(bool* open) {
     ImGui::Text("Status: %s", !g_initialized ? "no headset" : g_active ? "running" : "waiting for headset");
     if (g_active) {
         ImGui::Text("Per-eye resolution: %ux%u", xr::eye_width(), xr::eye_height());
+        ImGui::Text("Headset frame rate: %.0f fps", g_headsetFps);
     }
     checkbox("Enable VR (restart to apply)", vr.enabled);
     ImGui::SeparatorText("View");
@@ -1421,7 +1604,21 @@ void draw_imgui_window(bool* open) {
     if (ImGui::Button("Recenter")) {
         recenter();
     }
-    combo("Desktop window shows", vr.mirror, "Right eye\0HUD panel\0");
+    ImGui::SeparatorText("Desktop / streaming");
+    combo("Desktop window shows", vr.desktopView,
+        "Headset view (16:9)\0Smooth first person\0Third person, whole body\0"
+        "Selfie camera\0Raw right eye\0HUD panel\0");
+    checkbox("HUD on the desktop view", vr.spectatorHud);
+    sliderF("Desktop field of view", vr.spectatorFov, 40.f, 110.f, "%.0f deg");
+    sliderF("Desktop smoothing", vr.spectatorSmoothing, 0.f, 1.f);
+    checkbox("Keep desktop horizon level", vr.spectatorLevel);
+    {
+        int v = vr.spectatorRate;
+        if (ImGui::SliderInt("Draw desktop every N headset frames", &v, 1, 4)) {
+            vr.spectatorRate.setValue(v);
+            changed = true;
+        }
+    }
     ImGui::SeparatorText("HUD panel");
     sliderF("HUD distance", vr.hudDistance, 0.5f, 3.f, "%.2f m");
     sliderF("HUD width", vr.hudWidth, 0.5f, 3.f, "%.2f m");

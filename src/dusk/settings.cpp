@@ -213,7 +213,12 @@ UserSettings g_userSettings = {
         .hudDistance {"vr.hudDistance", 1.5f},
         .hudWidth {"vr.hudWidth", 1.5f},
         .hudHeight {"vr.hudHeight", -0.1f},
-        .mirror {"vr.mirror", 0},
+        .desktopView {"vr.desktopView", 0},
+        .spectatorHud {"vr.spectatorHud", true},
+        .spectatorFov {"vr.spectatorFov", 70.0f},
+        .spectatorRate {"vr.spectatorRate", 2},
+        .spectatorSmoothing {"vr.spectatorSmoothing", 0.25f},
+        .spectatorLevel {"vr.spectatorLevel", false},
         .fullBody {"vr.fullBody", true},
         .stillIdle {"vr.stillIdle", true},
         .legsOnlyWalk {"vr.legsOnlyWalk", true},
@@ -454,7 +459,12 @@ void registerSettings() {
     Register(g_userSettings.vr.hudDistance);
     Register(g_userSettings.vr.hudWidth);
     Register(g_userSettings.vr.hudHeight);
-    Register(g_userSettings.vr.mirror);
+    Register(g_userSettings.vr.desktopView);
+    Register(g_userSettings.vr.spectatorHud);
+    Register(g_userSettings.vr.spectatorFov);
+    Register(g_userSettings.vr.spectatorRate);
+    Register(g_userSettings.vr.spectatorSmoothing);
+    Register(g_userSettings.vr.spectatorLevel);
     Register(g_userSettings.vr.fullBody);
     Register(g_userSettings.vr.stillIdle);
     Register(g_userSettings.vr.legsOnlyWalk);

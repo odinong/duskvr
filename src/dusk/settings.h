@@ -375,7 +375,13 @@ struct UserSettings {
         ConfigVar<float> hudDistance;     // meters
         ConfigVar<float> hudWidth;        // meters
         ConfigVar<float> hudHeight;       // meters, relative to the eyes
-        ConfigVar<int> mirror;            // desktop window: 0 = right eye, 1 = HUD panel
+        ConfigVar<int> desktopView;       // 0 headset view (16:9), 1 smooth first person,
+                                          // 2 third person, 3 selfie, 4 raw right eye, 5 HUD
+        ConfigVar<bool> spectatorHud;     // draw the game's HUD on the spectator view
+        ConfigVar<float> spectatorFov;    // degrees, vertical
+        ConfigVar<int> spectatorRate;     // render the spectator view every Nth headset frame
+        ConfigVar<float> spectatorSmoothing; // 0 = follows the headset exactly, 1 = very smooth
+        ConfigVar<bool> spectatorLevel;   // keep the first-person desktop view's horizon level
         ConfigVar<bool> fullBody;         // first person shows Link's body, arms reaching the controllers
         ConfigVar<bool> stillIdle;        // first person: no idle animations, Link stands still
         ConfigVar<bool> legsOnlyWalk;     // first person: walking animates the legs only

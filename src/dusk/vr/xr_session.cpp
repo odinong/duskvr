@@ -130,7 +130,7 @@ std::array<XrSpace, 2> g_aimSpaces{};
 InputState g_input;
 
 // Blit pipelines, created on the render worker.
-enum class BlitKind { Copy, HudCompose, Cursor, Eye };
+enum class BlitKind { Copy, HudCompose, Cursor, Eye, Crop };
 struct BlitPipeline {
     BlitKind kind = BlitKind::Copy;
     wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
@@ -142,6 +142,9 @@ wgpu::ShaderModule g_blitShader;
 wgpu::ShaderModule g_hudShader;
 wgpu::ShaderModule g_cursorShader;
 wgpu::ShaderModule g_eyeShader;
+wgpu::ShaderModule g_cropShader;
+wgpu::Buffer g_cropParams;
+wgpu::Texture g_cropTexture;
 wgpu::Buffer g_eyeParams;
 float g_vignette = 0.f;
 
@@ -270,6 +273,37 @@ fn fs_unorm(in: VsOut) -> @location(0) vec4f {
 }
 )";
 
+// Stretches a sub-rectangle (params: x, y, width, height in UV) over the whole target.
+constexpr char kCropShader[] = R"(
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var<uniform> rect: vec4f;
+
+struct VsOut {
+    @builtin(position) pos: vec4f,
+    @location(0) uv: vec2f,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
+    var o: VsOut;
+    let uv = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+    o.pos = vec4f(uv * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0), 0.0, 1.0);
+    o.uv = uv;
+    return o;
+}
+
+@fragment
+fn fs_srgb(in: VsOut) -> @location(0) vec4f {
+    return vec4f(textureSample(src, samp, rect.xy + in.uv * rect.zw).rgb, 1.0);
+}
+
+@fragment
+fn fs_unorm(in: VsOut) -> @location(0) vec4f {
+    return vec4f(textureSample(src, samp, rect.xy + in.uv * rect.zw).rgb, 1.0);
+}
+)";
+
 constexpr char kCursorShader[] = R"(
 struct VsOut {
     @builtin(position) pos: vec4f,
@@ -384,6 +418,11 @@ const wgpu::RenderPipeline& blit_pipeline(
             .size = 16,
         };
         g_eyeParams = device.CreateBuffer(&paramsDesc);
+        g_cropParams = device.CreateBuffer(&paramsDesc);
+        wgpu::ShaderSourceWGSL cropWgsl;
+        cropWgsl.code = kCropShader;
+        const wgpu::ShaderModuleDescriptor cropDesc{.nextInChain = &cropWgsl, .label = "VR crop"};
+        g_cropShader = device.CreateShaderModule(&cropDesc);
         const wgpu::SamplerDescriptor samplerDesc{
             .label = "VR eye blit sampler",
             .magFilter = wgpu::FilterMode::Linear,
@@ -394,6 +433,7 @@ const wgpu::RenderPipeline& blit_pipeline(
     const wgpu::ShaderModule& shader = kind == BlitKind::HudCompose ? g_hudShader :
                                        kind == BlitKind::Cursor     ? g_cursorShader :
                                        kind == BlitKind::Eye        ? g_eyeShader :
+                                       kind == BlitKind::Crop       ? g_cropShader :
                                                                       g_blitShader;
     const wgpu::ColorTargetState target{.format = format};
     const wgpu::FragmentState fragment{
@@ -1031,6 +1071,9 @@ void shutdown() {
     g_cursorShader = {};
     g_eyeShader = {};
     g_eyeParams = {};
+    g_cropShader = {};
+    g_cropParams = {};
+    g_cropTexture = {};
     g_blitSampler = {};
 }
 
@@ -1146,7 +1189,69 @@ uint32_t eye_width() { return g_swapchains[0].width; }
 uint32_t eye_height() { return g_swapchains[0].height; }
 bool floor_relative() { return g_floorRelative; }
 
-void render_eye(int index) {
+// Draws `rect` (UV) of src over all of dst.
+void blit_rect(wgpu::CommandEncoder& encoder, const wgpu::TextureView& src, const wgpu::TextureView& dst,
+    wgpu::TextureFormat format, const float rect[4]) {
+    const wgpu::Device device = aurora::xr::device();
+    const auto& pipeline = blit_pipeline(device, format, BlitKind::Crop);
+    aurora::xr::queue().WriteBuffer(g_cropParams, 0, rect, 16);
+    const wgpu::BindGroupEntry entries[] = {
+        {.binding = 0, .textureView = src},
+        {.binding = 1, .sampler = g_blitSampler},
+        {.binding = 2, .buffer = g_cropParams, .size = 16},
+    };
+    const wgpu::BindGroupDescriptor bindDesc{
+        .layout = pipeline.GetBindGroupLayout(0),
+        .entryCount = 3,
+        .entries = entries,
+    };
+    const wgpu::RenderPassColorAttachment attachment{
+        .view = dst,
+        .loadOp = wgpu::LoadOp::Clear,
+        .storeOp = wgpu::StoreOp::Store,
+    };
+    const wgpu::RenderPassDescriptor passDesc{
+        .label = "VR desktop crop",
+        .colorAttachmentCount = 1,
+        .colorAttachments = &attachment,
+    };
+    const auto pass = encoder.BeginRenderPass(&passDesc);
+    pass.SetPipeline(pipeline);
+    pass.SetBindGroup(0, device.CreateBindGroup(&bindDesc));
+    pass.Draw(3);
+    pass.End();
+}
+
+// Turns the eye frame (already sent to the headset) into a 16:9 band of itself, so the desktop
+// window shows the headset view without bars and without rendering the scene again.
+void crop_for_desktop(wgpu::CommandEncoder& encoder, const aurora::xr::PresentSource& source,
+    const EyeView& eye) {
+    const wgpu::Device device = aurora::xr::device();
+    if (!g_cropTexture || g_cropTexture.GetWidth() != source.width ||
+        g_cropTexture.GetHeight() != source.height || g_cropTexture.GetFormat() != source.format)
+    {
+        const wgpu::TextureDescriptor desc{
+            .label = "VR desktop crop",
+            .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
+            .size = {source.width, source.height, 1},
+            .format = source.format,
+        };
+        g_cropTexture = device.CreateTexture(&desc);
+    }
+    // Full width; 16:9 worth of height, centred on where the eye looks straight ahead.
+    const float band = std::min(1.f, (static_cast<float>(source.width) * 9.f / 16.f) /
+                                         static_cast<float>(source.height));
+    const float up = std::tan(eye.angleUp);
+    const float down = -std::tan(eye.angleDown);
+    const float center = up + down > 0.f ? up / (up + down) : 0.5f;
+    const float top = std::clamp(center - band * 0.5f, 0.f, 1.f - band);
+    const float rect[4] = {0.f, top, 1.f, band};
+    const float full[4] = {0.f, 0.f, 1.f, 1.f};
+    blit_rect(encoder, source.view, g_cropTexture.CreateView(), source.format, rect);
+    blit_rect(encoder, g_cropTexture.CreateView(), source.view, source.format, full);
+}
+
+void render_eye(int index, bool desktopCrop) {
     auto& sc = g_swapchains[index];
     uint32_t image = 0;
     XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
@@ -1165,7 +1270,7 @@ void render_eye(int index) {
 
     aurora::xr::set_next_frame_hook(
         [target = sc.stagingTexture, memory = sc.stagingMemory, format = sc.format,
-            vignette = g_vignette](
+            vignette = g_vignette, desktopCrop, eye = g_eyes[index]](
             wgpu::CommandEncoder& encoder, const aurora::xr::PresentSource& source,
             std::vector<aurora::xr::AfterSubmitCallback>& afterSubmit) {
             const wgpu::Device device = aurora::xr::device();
@@ -1207,6 +1312,9 @@ void render_eye(int index) {
             pass.SetBindGroup(0, bindGroup);
             pass.Draw(3);
             pass.End();
+            if (desktopCrop) {
+                crop_for_desktop(encoder, source, eye);
+            }
 
             afterSubmit.push_back([target, memory] {
                 wgpu::SharedTextureMemoryEndAccessState state;

@@ -18,6 +18,7 @@ enum class Pass {
     Eye,       // 3D scene for one eye, no HUD
     HudBlack,  // HUD only, over black
     HudWhite,  // HUD only, over white
+    Spectator, // 16:9 view for the desktop window (streaming)
 };
 
 #if DUSK_VR
@@ -37,6 +38,12 @@ void begin_eye(int eye);
 // The HUD is redrawn after simulation ticks: two extra frames, over black then over white.
 bool hud_pending();
 void begin_hud(int phase);
+// The desktop window gets its own 16:9 camera (smoothed first person, third person or selfie),
+// drawn every few headset frames.
+bool spectator_pending();
+void begin_spectator();
+// Whether the spectator view should include the 2D HUD.
+bool spectator_hud();
 void end_frame();
 Pass render_pass();
 // The background the frame after this one needs (HUD passes), as a gray level.
@@ -69,6 +76,9 @@ inline int eye_count() { return 0; }
 inline void begin_eye(int) {}
 inline bool hud_pending() { return false; }
 inline void begin_hud(int) {}
+inline bool spectator_pending() { return false; }
+inline void begin_spectator() {}
+inline bool spectator_hud() { return true; }
 inline void end_frame() {}
 inline Pass render_pass() { return Pass::Flat; }
 inline bool next_frame_clear(u8&) { return false; }

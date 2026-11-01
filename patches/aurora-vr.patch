@@ -13,10 +13,10 @@ index dfeed19..277adf8 100644
  
 diff --git a/include/aurora/xr.hpp b/include/aurora/xr.hpp
 new file mode 100644
-index 0000000..084ff3e
+index 0000000..0fd91c9
 --- /dev/null
 +++ b/include/aurora/xr.hpp
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,51 @@
 +#pragma once
 +
 +#include <webgpu/webgpu_cpp.h>
@@ -51,6 +51,10 @@ index 0000000..084ff3e
 +// every frame.
 +void set_next_frame_window_present(bool enabled);
 +
++// Stretch the next frame over the whole window instead of fitting its aspect (for content drawn
++// squeezed into a differently shaped framebuffer). Resets after every frame.
++void set_next_frame_present_fill(bool fill);
++
 +// Overrides the content framebuffer (EFB) size, independent of the window. 0x0 clears the
 +// override. Takes effect on the next swapchain refresh.
 +void set_framebuffer_override(uint32_t width, uint32_t height);
@@ -65,7 +69,7 @@ index 0000000..084ff3e
 +
 +} // namespace aurora::xr
 diff --git a/lib/aurora.cpp b/lib/aurora.cpp
-index 9430842..2ce4c1f 100644
+index 9430842..760dd38 100644
 --- a/lib/aurora.cpp
 +++ b/lib/aurora.cpp
 @@ -25,6 +25,8 @@
@@ -77,19 +81,39 @@ index 9430842..2ce4c1f 100644
  #include <SDL3/SDL_filesystem.h>
  #include <magic_enum.hpp>
  
-@@ -32,6 +34,11 @@
+@@ -32,6 +34,12 @@
  #include "tracy/Tracy.hpp"
  
  namespace aurora {
 +namespace xr::detail {
 +FrameHook take_frame_hook();
 +bool take_window_present();
++bool take_present_fill();
 +} // namespace xr::detail
 +
  AuroraConfig g_config;
  uint32_t g_sdlCustomEventsStart;
  char g_gameName[4];
-@@ -286,14 +293,26 @@ void end_frame() noexcept {
+@@ -271,9 +279,15 @@ void end_frame() noexcept {
+   auto imguiDrawData = imgui::freeze();
+ 
+   const auto& presentSource = webgpu::present_source();
+-  const auto viewport = webgpu::calculate_present_viewport(webgpu::g_graphicsConfig.surfaceConfiguration.width,
+-                                                           webgpu::g_graphicsConfig.surfaceConfiguration.height,
+-                                                           presentSource.size.width, presentSource.size.height);
++  auto viewport = webgpu::calculate_present_viewport(webgpu::g_graphicsConfig.surfaceConfiguration.width,
++                                                     webgpu::g_graphicsConfig.surfaceConfiguration.height,
++                                                     presentSource.size.width, presentSource.size.height);
++  if (xr::detail::take_present_fill()) {
++    viewport.left = 0.f;
++    viewport.top = 0.f;
++    viewport.width = static_cast<float>(webgpu::g_graphicsConfig.surfaceConfiguration.width);
++    viewport.height = static_cast<float>(webgpu::g_graphicsConfig.surfaceConfiguration.height);
++  }
+ 
+   wgpu::BindGroup rmlBindGroup;
+   bool rmlOverlay = false;
+@@ -286,14 +300,26 @@ void end_frame() noexcept {
  #endif
  
    gfx::end_frame([rmlBindGroup = std::move(rmlBindGroup), rmlOverlay, viewport,
@@ -118,7 +142,7 @@ index 9430842..2ce4c1f 100644
          ZoneScopedN("Acquire texture");
          wgpu::SurfaceTexture surfaceTexture;
          g_surface.GetCurrentTexture(&surfaceTexture);
-@@ -363,7 +382,7 @@ void end_frame() noexcept {
+@@ -363,7 +389,7 @@ void end_frame() noexcept {
          imgui::render(pass, imguiDrawData);
          pass.End();
        }
@@ -127,7 +151,7 @@ index 9430842..2ce4c1f 100644
        Log.info("Skipping present; window not presentable");
      }
      webgpu::gpu_prof::frame_end(encoder);
-@@ -389,7 +408,7 @@ void end_frame() noexcept {
+@@ -389,7 +415,7 @@ void end_frame() noexcept {
          Log.warn("Surface present failed");
          webgpu::release_surface();
        }
@@ -215,10 +239,10 @@ index 2a4aadf..4e80cc4 100644
                                                                                                  jboolean ready) {
 diff --git a/lib/xr.cpp b/lib/xr.cpp
 new file mode 100644
-index 0000000..aafeebe
+index 0000000..b650664
 --- /dev/null
 +++ b/lib/xr.cpp
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,34 @@
 +#include "aurora/xr.hpp"
 +
 +#include "gfx/frame.hpp"
@@ -229,16 +253,20 @@ index 0000000..aafeebe
 +namespace {
 +FrameHook g_nextFrameHook;
 +bool g_nextFrameWindowPresent = true;
++bool g_nextFramePresentFill = false;
 +} // namespace
 +
 +namespace detail {
 +FrameHook take_frame_hook() { return std::exchange(g_nextFrameHook, {}); }
 +bool take_window_present() { return std::exchange(g_nextFrameWindowPresent, true); }
++bool take_present_fill() { return std::exchange(g_nextFramePresentFill, false); }
 +} // namespace detail
 +
 +void set_next_frame_hook(FrameHook hook) { g_nextFrameHook = std::move(hook); }
 +
 +void set_next_frame_window_present(bool enabled) { g_nextFrameWindowPresent = enabled; }
++
++void set_next_frame_present_fill(bool fill) { g_nextFramePresentFill = fill; }
 +
 +void synchronize() { gfx::gpu_synchronize(); }
 +
