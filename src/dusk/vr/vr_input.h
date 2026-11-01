@@ -10,6 +10,7 @@ struct FrameResult {
     bool recenter = false;
     bool toggleView = false;
     bool openDusklightMenu = false;  // Menu held
+    bool menuTap = false;            // Menu tapped (the game's Start)
 };
 
 struct Context {
@@ -43,5 +44,7 @@ bool bow_aim(Vec3& dir);
 
 // While the laser points at a menu, the trigger clicks instead of pressing B.
 void set_pointer_captured(bool captured);
+bool pointer_captured();
+bool bow_drawing();
 
 }  // namespace dusk::vr::input

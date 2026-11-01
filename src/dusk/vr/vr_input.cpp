@@ -38,7 +38,6 @@ struct Latched {
     bool dig = false;   // wolf: A
     bool spur = false;  // horse: A
     bool toss = false;  // carrying: A throws
-    bool start = false; // Menu tapped
 };
 
 Latched g_latched;
@@ -410,7 +409,7 @@ FrameResult update_frame(const xr::InputState& in, const Pose& head, float dt, c
         }
     } else {
         if (g_menuHeld > 0.f && g_menuHeld < kMenuHold) {
-            g_latched.start = true;
+            result.menuTap = true;
         }
         g_menuHeld = 0.f;
     }
@@ -470,46 +469,22 @@ FrameResult update_frame(const xr::InputState& in, const Pose& head, float dt, c
     return result;
 }
 
+// Buttons and sticks reach the game through the VR gamepad (vr_gamepad); this adds what the body
+// does: swings, the shield, the bow string, climbing and swimming strokes and the rest.
 void sync_virtual_pad(const Context& ctx) {
     const auto& in = g_lastInput;
-    const int s = sword_hand();
     const int o = shield_hand();
 
     PADStatus status{};
     status.err = PAD_ERR_NONE;
-
-    // Movement on the off-hand stick.
-    status.stickX = to_stick(deadzone(in.stickX[o]));
-    status.stickY = to_stick(deadzone(in.stickY[o]));
-
-    // Camera on the sword-hand stick in third person; menus get the stick as well.
-    if (!ctx.firstPerson || !ctx.gameplay) {
-        status.substickX = to_stick(deadzone(in.stickX[s]));
-        status.substickY = to_stick(deadzone(in.stickY[s]));
-    }
-
     u16 buttons = 0;
-    if (in.trigger[s] > 0.6f && !g_pointerCaptured) buttons |= PAD_BUTTON_B;
-    if (in.buttonLower[s]) buttons |= PAD_BUTTON_A;
-    if (in.buttonUpper[s]) buttons |= PAD_TRIGGER_Z;
-    if (in.buttonLower[o]) buttons |= PAD_BUTTON_X;
-    if (in.buttonUpper[o]) buttons |= PAD_BUTTON_Y;
-    if (g_latched.start) buttons |= PAD_BUTTON_START;
-    if (in.trigger[o] > 0.6f) {
-        buttons |= PAD_TRIGGER_L;
-        status.triggerLeft = 200;
-    }
-    if (in.squeeze[o] > 0.6f) {
-        buttons |= PAD_TRIGGER_R;
-        status.triggerRight = 200;
-    }
 
     if (ctx.gameplay && g_bowDrawing) {
         buttons |= ctx.bowSlot == 1 ? PAD_BUTTON_Y : PAD_BUTTON_X;
     }
 
     if (ctx.gameplay && getSettings().vr.motionControls) {
-        const bool stickIdle = status.stickX == 0 && status.stickY == 0;
+        const bool stickIdle = deadzone(in.stickX[o]) == 0.f && deadzone(in.stickY[o]) == 0.f;
         if (ctx.climbing && g_climbActive && stickIdle) {
             status.stickX = to_stick(g_climbX);
             status.stickY = to_stick(g_climbY);
@@ -566,5 +541,9 @@ void sync_virtual_pad(const Context& ctx) {
     status.button = buttons;
     PADSetVirtualStatus(PAD_CHAN0, &status);
 }
+
+bool pointer_captured() { return g_pointerCaptured; }
+
+bool bow_drawing() { return g_bowDrawing; }
 
 }  // namespace dusk::vr::input

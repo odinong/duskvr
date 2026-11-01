@@ -1794,6 +1794,37 @@ void end_frame() {
 
 const InputState& input() { return g_input; }
 
+const char* controller_name() {
+    if (g_session == XR_NULL_HANDLE) {
+        return "";
+    }
+    XrInteractionProfileState state{XR_TYPE_INTERACTION_PROFILE_STATE};
+    if (XR_FAILED(xrGetCurrentInteractionProfile(g_session, g_handPaths[kRight], &state)) ||
+        state.interactionProfile == XR_NULL_PATH)
+    {
+        return "";
+    }
+    char buf[XR_MAX_PATH_LENGTH]{};
+    uint32_t len = 0;
+    if (XR_FAILED(xrPathToString(g_instance, state.interactionProfile, sizeof(buf), &len, buf))) {
+        return "";
+    }
+    const std::string_view profile{buf};
+    if (profile.find("valve/index") != std::string_view::npos) {
+        return "Valve Index Controllers (VR)";
+    }
+    if (profile.find("oculus/touch") != std::string_view::npos) {
+        return "Touch Controllers (VR)";
+    }
+    if (profile.find("htc/vive") != std::string_view::npos) {
+        return "Vive Controllers (VR)";
+    }
+    if (profile.find("microsoft/motion") != std::string_view::npos) {
+        return "Mixed Reality Controllers (VR)";
+    }
+    return "VR Controllers";
+}
+
 void haptic(Hand hand, float amplitude, float seconds) {
     if (!g_running || g_haptic == XR_NULL_HANDLE) {
         return;

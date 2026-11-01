@@ -71,6 +71,8 @@ void set_cursor(bool visible, const Pose& pose, float sizeMeters);
 void end_frame();
 
 const InputState& input();
+// A friendly name for the controllers SteamVR is using ("" until known).
+const char* controller_name();
 void haptic(Hand hand, float amplitude, float seconds);
 double predicted_display_seconds();
 

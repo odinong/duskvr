@@ -27,6 +27,11 @@ CMake fetches the OpenXR loader (OpenXR-SDK release-1.1.62). Turn VR off with `-
 
 ## Controls
 
+Your VR controllers appear in Dusklight's Input menu as a gamepad ("Valve Index Controllers (VR)",
+"Touch Controllers (VR)", ... or "VR Controllers" until SteamVR reports which ones you have) and
+take player 1 while VR runs; the controller that had player 1 gets it back afterwards. Every button
+can be rebound there like any controller. The motion controls below work on top of the bindings.
+
 The sword hand is the right controller by default (Settings: left handed).
 
 | Input | Action |

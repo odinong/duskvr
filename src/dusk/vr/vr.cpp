@@ -6,6 +6,7 @@
 #include "dusk/ui/ui.hpp"
 #include "dusk/settings.h"
 #include "dusk/config.hpp"
+#include "dusk/vr/vr_gamepad.h"
 #include "dusk/vr/vr_input.h"
 #include "dusk/vr/xr_session.h"
 
@@ -31,6 +32,7 @@
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 #include <cmath>
 
@@ -219,9 +221,11 @@ void activate() {
     g_needsRecenter = true;
     aurora::xr::set_framebuffer_override(xr::eye_width(), xr::eye_height());
     aurora_enable_vsync(false);
-    // The desktop window usually loses focus to the headset; never pause for that.
+    // The desktop window usually loses focus to the headset; never pause for that, and keep
+    // reading controllers.
     g_prevPauseOnFocusLost = getSettings().game.pauseOnFocusLost;
     aurora_set_pause_on_focus_lost(false);
+    aurora_set_background_input(true);
     Log.info("VR active: {}x{} per eye", xr::eye_width(), xr::eye_height());
 }
 
@@ -230,7 +234,9 @@ void deactivate() {
     aurora::xr::set_framebuffer_override(0, 0);
     aurora_enable_vsync(getSettings().video.enableVsync);
     aurora_set_pause_on_focus_lost(g_prevPauseOnFocusLost);
+    aurora_set_background_input(getSettings().game.allowBackgroundInput);
     PADClearVirtualStatus(PAD_CHAN0);
+    gamepad::detach();
     Log.info("VR inactive");
 }
 
@@ -428,76 +434,62 @@ void update_pointer() {
     xr::set_cursor(true, hit, 0.02f * g_hudWidth / 1.5f);
 }
 
-// Controller buttons and sticks for Dusklight's own menus, as the keys its gamepad support sends:
-// stick = arrows, A = confirm, B = back, grips = previous/next tab, Menu = close.
-void update_menu_keys(float dt, bool openMenu) {
-    auto* context = aurora::rmlui::get_context();
-    if (context == nullptr) {
-        return;
+// The controllers as a gamepad: what Dusklight's input menu lists and rebinds, and what drives its
+// own menus. Default layout (sword hand on the right): A = A, trigger = B, B = Z, left X/Y = X/Y,
+// left trigger = L, left grip = R, sticks = sticks, Menu = Start (tap) / Dusklight menu (hold).
+void update_gamepad(const input::FrameResult& result) {
+    static int frames = 0;
+    static std::string attachedName;
+    const char* name = xr::controller_name();
+    // SteamVR names the controllers once the session has input focus (headset on). Until then they
+    // are "VR Controllers"; re-register under the real name as soon as it is known.
+    if (gamepad::attached() && name[0] != '\0' && attachedName != name) {
+        gamepad::detach();
     }
-    const auto tap = [&](Rml::Input::KeyIdentifier key) {
-        context->ProcessKeyDown(key, 0);
-        context->ProcessKeyUp(key, 0);
-    };
-    if (openMenu) {
-        tap(Rml::Input::KI_F1);
-    }
-    static xr::InputState prev;
-    static Rml::Input::KeyIdentifier heldDir = Rml::Input::KI_UNKNOWN;
-    static float repeatTimer = 0.f;
-    const auto& in = xr::input();
-    if (!ui::any_document_visible()) {
-        prev = in;
-        heldDir = Rml::Input::KI_UNKNOWN;
-        return;
-    }
-    const auto pressed = [&](bool now, bool before) { return now && !before; };
-    for (int h = 0; h < 2; ++h) {
-        if (pressed(in.buttonLower[h], prev.buttonLower[h])) {
-            tap(Rml::Input::KI_RETURN);
+    if (!gamepad::attached()) {
+        if (name[0] == '\0' && ++frames < 300) {
+            return;
         }
-        if (pressed(in.buttonUpper[h], prev.buttonUpper[h])) {
-            tap(Rml::Input::KI_ESCAPE);
-        }
+        attachedName = name[0] != '\0' ? name : "VR Controllers";
+        gamepad::attach(attachedName.c_str());
     }
-    if (pressed(in.squeeze[xr::kLeft] > 0.6f, prev.squeeze[xr::kLeft] > 0.6f)) {
-        tap(Rml::Input::KI_PRIOR);
+    static int startFrames = 0, backFrames = 0;
+    if (result.menuTap) {
+        startFrames = 4;
     }
-    if (pressed(in.squeeze[xr::kRight] > 0.6f, prev.squeeze[xr::kRight] > 0.6f)) {
-        tap(Rml::Input::KI_NEXT);
-    }
-    if (pressed(in.menu, prev.menu) && !openMenu) {
-        tap(Rml::Input::KI_F1);
+    if (result.openDusklightMenu) {
+        backFrames = 4;
     }
 
-    // Stick: the stronger of the two, with key repeat.
-    float sx = 0.f, sy = 0.f;
-    for (int h = 0; h < 2; ++h) {
-        if (std::hypot(in.stickX[h], in.stickY[h]) > std::hypot(sx, sy)) {
-            sx = in.stickX[h];
-            sy = in.stickY[h];
-        }
-    }
-    Rml::Input::KeyIdentifier dir = Rml::Input::KI_UNKNOWN;
-    if (std::fabs(sy) > 0.6f && std::fabs(sy) >= std::fabs(sx)) {
-        dir = sy > 0.f ? Rml::Input::KI_UP : Rml::Input::KI_DOWN;
-    } else if (std::fabs(sx) > 0.6f) {
-        dir = sx > 0.f ? Rml::Input::KI_RIGHT : Rml::Input::KI_LEFT;
-    }
-    if (dir != heldDir) {
-        heldDir = dir;
-        repeatTimer = 0.4f;
-        if (dir != Rml::Input::KI_UNKNOWN) {
-            tap(dir);
-        }
-    } else if (dir != Rml::Input::KI_UNKNOWN) {
-        repeatTimer -= dt;
-        if (repeatTimer <= 0.f) {
-            tap(dir);
-            repeatTimer = 0.12f;
-        }
-    }
-    prev = in;
+    const auto& in = xr::input();
+    const int s = input::sword_hand();
+    const int o = input::shield_hand();
+    const bool menus = ui::any_document_visible();
+    // In first person the sword-hand stick turns you; the game camera has nothing to do.
+    const bool turning = g_firstPersonFrame && g_controllable && !menus;
+    // The trigger clicks menus and draws the bow string; then it isn't B.
+    const bool triggerBusy = input::pointer_captured() || (g_bowReady && getSettings().vr.motionControls);
+
+    gamepad::State st;
+    st.leftX = in.stickX[o];
+    st.leftY = in.stickY[o];
+    st.rightX = turning ? 0.f : in.stickX[s];
+    st.rightY = turning ? 0.f : in.stickY[s];
+    st.leftTrigger = in.trigger[o];
+    st.rightTrigger = in.squeeze[o];
+    st.south = in.buttonLower[s];
+    st.east = in.trigger[s] > 0.6f && !triggerBusy;
+    st.west = in.buttonLower[o];
+    st.north = in.buttonUpper[o];
+    st.rightShoulder = in.buttonUpper[s];
+    st.leftShoulder = in.squeeze[s] > 0.6f;
+    st.leftStick = in.stickClick[o];
+    st.rightStick = in.stickClick[s];
+    st.start = startFrames > 0;
+    st.back = backFrames > 0;
+    startFrames = std::max(0, startFrames - 1);
+    backFrames = std::max(0, backFrames - 1);
+    gamepad::update(st);
 }
 
 }  // namespace
@@ -610,7 +602,7 @@ bool begin_frame() {
     update_pointer();
 
     const auto result = input::update_frame(xr::input(), xr::head(), dt, g_ctx);
-    update_menu_keys(dt, result.openDusklightMenu);
+    update_gamepad(result);
     turn(result.turnRad);
     {
         static float vignette = 0.f;
