@@ -276,16 +276,65 @@ Quat euler_offset(float pitch, float yaw, float roll) {
            Quat::axisAngle({0.f, 0.f, 1.f}, deg2rad(roll));
 }
 
-Quat item_offset(xr::Hand hand) {
-    const auto& vr = getSettings().vr;
-    if (hand == input::sword_hand()) {
-        return euler_offset(vr.handOffsetPitch.getValue(), vr.handOffsetYaw.getValue(),
-                   vr.handOffsetRoll.getValue()) *
-               kItemFromGrip;
+// Each item joint relative to its hand in Link's own grip (from his animation). The two aren't
+// mirror images: the left joint carries the sword along its +X, the right one carries the shield
+// as an extension of the hand.
+constexpr Mtx kLeftItemFromHand = {
+    {0.343f, 0.f, -0.939f, 9.7f}, {0.939f, 0.f, 0.343f, 2.1f}, {0.f, -1.f, 0.f, 3.0f}};
+constexpr Mtx kRightItemFromHand = {
+    {0.998f, 0.f, -0.069f, 10.3f}, {0.f, 1.f, 0.002f, 0.f}, {0.069f, -0.002f, 0.998f, -3.2f}};
+
+// Link's hand joint in the controller's grip frame. The left hand is fitted so the sword it holds
+// lines up with the controller. The right hand is its mirror image: the grip frame is the same for
+// both controllers (+X to the right), so mirror across the grip's YZ plane, and Link's right hand
+// joints are his left ones mirrored with their Z flipped.
+void hand_from_grip(xr::Hand hand, Mtx out) {
+    Mtx k, inv;
+    build_world_matrix(k, kItemFromGrip, {});
+    MTXInverse(kLeftItemFromHand, inv);
+    MTXConcat(k, inv, out);
+    if (hand == xr::kRight) {
+        for (int c = 0; c < 4; ++c) {
+            out[0][c] = -out[0][c];
+        }
+        for (int r = 0; r < 3; ++r) {
+            out[r][2] = -out[r][2];
+        }
     }
-    return euler_offset(vr.shieldOffsetPitch.getValue(), vr.shieldOffsetYaw.getValue(),
-               vr.shieldOffsetRoll.getValue()) *
-           kItemFromGrip;
+}
+
+// The item joint in the controller's grip frame, with the player's sword or shield calibration.
+// An item on its own side sits in the hand the way Link holds it. Swapped to the other side, the
+// sword lines up with the controller, and the shield is held the way Link's right hand holds it,
+// mirrored: its face out of the back of the hand, its top toward the elbow.
+void item_from_grip(xr::Hand hand, bool swapped, Mtx out) {
+    const auto& vr = getSettings().vr;
+    const Quat offset = hand == input::sword_hand()
+                            ? euler_offset(vr.handOffsetPitch.getValue(),
+                                  vr.handOffsetYaw.getValue(), vr.handOffsetRoll.getValue())
+                            : euler_offset(vr.shieldOffsetPitch.getValue(),
+                                  vr.shieldOffsetYaw.getValue(), vr.shieldOffsetRoll.getValue());
+    Mtx local, hand_;
+    if (swapped && hand == xr::kRight) {
+        build_world_matrix(local, kItemFromGrip, {});
+    } else if (swapped) {
+        Mtx mirrored;
+        MTXCopy(kRightItemFromHand, mirrored);
+        for (int c = 0; c < 4; ++c) {
+            mirrored[2][c] = -mirrored[2][c];
+        }
+        for (int r = 0; r < 3; ++r) {
+            mirrored[r][1] = -mirrored[r][1];
+        }
+        hand_from_grip(hand, hand_);
+        MTXConcat(hand_, mirrored, local);
+    } else {
+        hand_from_grip(hand, hand_);
+        MTXConcat(hand_, hand == xr::kLeft ? kLeftItemFromHand : kRightItemFromHand, local);
+    }
+    Mtx o;
+    build_world_matrix(o, offset, {});
+    MTXConcat(o, local, out);
 }
 
 // Maps a tracking-space point to the world, anchored at Link (first person).
@@ -471,10 +520,12 @@ void update_gamepad(const input::FrameResult& result) {
     const bool triggerBusy = input::pointer_captured() || (g_bowReady && getSettings().vr.motionControls);
 
     gamepad::State st;
-    st.leftX = in.stickX[o];
-    st.leftY = in.stickY[o];
-    st.rightX = turning ? 0.f : in.stickX[s];
-    st.rightY = turning ? 0.f : in.stickY[s];
+    // Dusklight's menus are driven by the laser alone: a drifting stick would keep moving the
+    // focus, so the sticks are ignored there.
+    st.leftX = menus ? 0.f : in.stickX[o];
+    st.leftY = menus ? 0.f : in.stickY[o];
+    st.rightX = turning || menus ? 0.f : in.stickX[s];
+    st.rightY = turning || menus ? 0.f : in.stickY[s];
     st.leftTrigger = in.trigger[o];
     st.rightTrigger = in.squeeze[o];
     st.south = in.buttonLower[s];
@@ -1135,20 +1186,14 @@ void collect_subtree(J3DModelData* data, int root, std::vector<u16>& out) {
     }
 }
 
-// Two-bone IK: bends the arm so the weapon joint lands on the controller. The elbow hangs down
-// and out to the side, the way a relaxed arm does. Reaching past full extension stretches the arm
-// a little rather than letting the hand fall short of the controller.
-void solve_arm(J3DModel* model, const ArmChain& chain, const Mtx weaponTarget, const Vec3& bodyFwd,
-    const Vec3& bodyRight, bool leftSide) {
+// Two-bone IK: bends the arm so the hand lands on the controller, then puts the item joint where
+// the held item belongs. The elbow hangs down and out to the side, the way a relaxed arm does.
+// Reaching past full extension stretches the arm a little rather than letting the hand fall short
+// of the controller.
+void solve_arm(J3DModel* model, const ArmChain& chain, const Mtx handTarget, const Mtx itemTarget,
+    const Vec3& bodyFwd, const Vec3& bodyRight, bool leftSide) {
     J3DModelData* data = model->getModelData();
     const auto M = [&](int j) { return model->getAnmMtx(j); };
-
-    // Where the hand must be for the weapon joint to hit the target.
-    Mtx handInv, rel, relInv, handTarget;
-    MTXInverse(M(chain.hand), handInv);
-    MTXConcat(handInv, M(chain.weapon), rel);
-    MTXInverse(rel, relInv);
-    MTXConcat(weaponTarget, relInv, handTarget);
 
     const Vec3 shoulder = mtx_pos(M(chain.upper));
     const Vec3 elbow = mtx_pos(M(chain.lower));
@@ -1190,16 +1235,20 @@ void solve_arm(J3DModel* model, const ArmChain& chain, const Mtx weaponTarget, c
     for (u16 j : joints) {
         rotate_about(M(j), lowerRot, movedElbow, newElbow - movedElbow);
     }
-    // The hand (and weapon) take the controller's pose exactly.
-    collect_subtree(data, chain.hand, joints);
-    Mtx inv, delta;
-    MTXInverse(M(chain.hand), inv);
-    MTXConcat(handTarget, inv, delta);
-    for (u16 j : joints) {
-        Mtx m;
-        MTXConcat(delta, M(j), m);
-        MTXCopy(m, M(j));
-    }
+    // The hand, then the item it holds, take the controller's pose exactly.
+    const auto place = [&](int joint, const Mtx target) {
+        collect_subtree(data, joint, joints);
+        Mtx inv, delta;
+        MTXInverse(M(joint), inv);
+        MTXConcat(target, inv, delta);
+        for (u16 j : joints) {
+            Mtx m;
+            MTXConcat(delta, M(j), m);
+            MTXCopy(m, M(j));
+        }
+    };
+    place(chain.hand, handTarget);
+    place(chain.weapon, itemTarget);
 }
 
 // Joint parents from the model's joint tree.
@@ -1500,10 +1549,15 @@ void override_link_hands(daAlink_c* link) {
         if (!state.active) {
             continue;
         }
-        Mtx& target = g_placements[hand].simTarget;
-        build_world_matrix(target, Quat::yaw(g_yawOffset) * state.grip.orientation * item_offset(hand),
+        Mtx& grip = g_placements[hand].simTarget;
+        build_world_matrix(grip, Quat::yaw(g_yawOffset) * state.grip.orientation,
             tracking_to_world_fp(state.grip.position, anchor));
-        solve_arm(model, arm_for(hand), target, fwd, right, hand == xr::kLeft);
+        Mtx local, handTarget, itemTarget;
+        hand_from_grip(hand, local);
+        MTXConcat(grip, local, handTarget);
+        item_from_grip(hand, g_itemsSwapped, local);
+        MTXConcat(grip, local, itemTarget);
+        solve_arm(model, arm_for(hand), handTarget, itemTarget, fwd, right, hand == xr::kLeft);
         g_placements[hand].valid = true;
         posed = true;
     }
@@ -1550,7 +1604,7 @@ void latch_hands(daAlink_c* link, float step) {
             return;
         }
         Mtx now, inv, delta;
-        build_world_matrix(now, Quat::yaw(g_yawOffset) * state.grip.orientation * item_offset(hand),
+        build_world_matrix(now, Quat::yaw(g_yawOffset) * state.grip.orientation,
             tracking_to_world_fp(state.grip.position, anchor));
         MTXInverse(g_placements[hand].simTarget, inv);
         MTXConcat(now, inv, delta);
