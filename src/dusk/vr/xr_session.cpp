@@ -82,6 +82,23 @@ struct Swapchain {
 };
 std::array<Swapchain, 2> g_swapchains;
 
+// HUD panel: a quad layer fed from the black/white HUD passes.
+Swapchain g_hud;
+wgpu::Texture g_hudBlack;  // first HUD pass, kept until the white pass composes
+bool g_hudRendered = false;  // a new HUD image is waiting to be copied this frame
+bool g_hudValid = false;     // the HUD swapchain holds an image
+Pose g_hudPose;
+float g_hudWidth = 1.3f;
+float g_hudHeight = 0.73f;
+
+// Menu pointer dot. Its image never changes, so it is drawn once.
+Swapchain g_cursor;
+bool g_cursorRendered = false;  // drawn this frame, waiting to be copied
+bool g_cursorValid = false;
+bool g_cursorVisible = false;
+Pose g_cursorPose;
+float g_cursorSize = 0.02f;
+
 ComPtr<ID3D12Device> g_d3dDevice;
 ComPtr<ID3D12CommandQueue> g_d3dQueue;
 ComPtr<ID3D12Fence> g_copyFence;
@@ -113,13 +130,17 @@ std::array<XrSpace, 2> g_aimSpaces{};
 InputState g_input;
 
 // Blit pipelines, created on the render worker.
+enum class BlitKind { Copy, HudCompose, Cursor };
 struct BlitPipeline {
+    BlitKind kind = BlitKind::Copy;
     wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
     wgpu::RenderPipeline pipeline;
 };
 std::vector<BlitPipeline> g_blitPipelines;
 wgpu::Sampler g_blitSampler;
 wgpu::ShaderModule g_blitShader;
+wgpu::ShaderModule g_hudShader;
+wgpu::ShaderModule g_cursorShader;
 
 std::string result_string(XrResult res) {
     char buf[XR_MAX_RESULT_STRING_SIZE]{};
@@ -201,9 +222,93 @@ fn fs_unorm(in: VsOut) -> @location(0) vec4f {
 }
 )";
 
-const wgpu::RenderPipeline& blit_pipeline(const wgpu::Device& device, wgpu::TextureFormat format) {
+constexpr char kCursorShader[] = R"(
+struct VsOut {
+    @builtin(position) pos: vec4f,
+    @location(0) uv: vec2f,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
+    var o: VsOut;
+    let uv = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+    o.pos = vec4f(uv * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0), 0.0, 1.0);
+    o.uv = uv;
+    return o;
+}
+
+// A white dot with a dark rim, premultiplied. Linear and sRGB targets look the same for 0 and 1.
+fn dot(uv: vec2f) -> vec4f {
+    let d = length(uv - vec2f(0.5)) * 2.0;
+    let fill = 1.0 - smoothstep(0.55, 0.65, d);
+    let rim = 1.0 - smoothstep(0.85, 0.95, d);
+    return vec4f(vec3f(fill), rim);
+}
+
+@fragment
+fn fs_srgb(in: VsOut) -> @location(0) vec4f {
+    return dot(in.uv);
+}
+
+@fragment
+fn fs_unorm(in: VsOut) -> @location(0) vec4f {
+    return dot(in.uv);
+}
+)";
+
+// The HUD is drawn twice, over black and over white. Where it is opaque both agree; where it is
+// see-through the white pass is brighter by exactly (1 - alpha). Outputs premultiplied alpha.
+constexpr char kHudShader[] = R"(
+@group(0) @binding(0) var black: texture_2d<f32>;
+@group(0) @binding(1) var white: texture_2d<f32>;
+@group(0) @binding(2) var samp: sampler;
+
+struct VsOut {
+    @builtin(position) pos: vec4f,
+    @location(0) uv: vec2f,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
+    var o: VsOut;
+    let uv = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+    o.pos = vec4f(uv * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0), 0.0, 1.0);
+    o.uv = uv;
+    return o;
+}
+
+fn to_linear(c: vec3f) -> vec3f {
+    let lo = c / 12.92;
+    let hi = pow((c + vec3f(0.055)) / 1.055, vec3f(2.4));
+    return select(hi, lo, c <= vec3f(0.04045));
+}
+
+fn compose(uv: vec2f) -> vec4f {
+    let b = textureSample(black, samp, uv).rgb;
+    let w = textureSample(white, samp, uv).rgb;
+    let d = w - b;
+    let a = clamp(1.0 - max(d.r, max(d.g, d.b)), 0.0, 1.0);
+    let c = select(vec3f(0.0), clamp(b / a, vec3f(0.0), vec3f(1.0)), a > 0.004);
+    return vec4f(c, a);
+}
+
+@fragment
+fn fs_srgb(in: VsOut) -> @location(0) vec4f {
+    let c = compose(in.uv);
+    return vec4f(to_linear(c.rgb) * c.a, c.a);
+}
+
+@fragment
+fn fs_unorm(in: VsOut) -> @location(0) vec4f {
+    let c = compose(in.uv);
+    return vec4f(c.rgb * c.a, c.a);
+}
+)";
+
+const wgpu::RenderPipeline& blit_pipeline(
+    const wgpu::Device& device, wgpu::TextureFormat format, BlitKind kind = BlitKind::Copy) {
     for (const auto& p : g_blitPipelines) {
-        if (p.format == format) {
+        if (p.format == format && p.kind == kind) {
             return p.pipeline;
         }
     }
@@ -212,6 +317,15 @@ const wgpu::RenderPipeline& blit_pipeline(const wgpu::Device& device, wgpu::Text
         wgsl.code = kBlitShader;
         const wgpu::ShaderModuleDescriptor desc{.nextInChain = &wgsl, .label = "VR eye blit"};
         g_blitShader = device.CreateShaderModule(&desc);
+        wgpu::ShaderSourceWGSL hudWgsl;
+        hudWgsl.code = kHudShader;
+        const wgpu::ShaderModuleDescriptor hudDesc{.nextInChain = &hudWgsl, .label = "VR HUD"};
+        g_hudShader = device.CreateShaderModule(&hudDesc);
+        wgpu::ShaderSourceWGSL cursorWgsl;
+        cursorWgsl.code = kCursorShader;
+        const wgpu::ShaderModuleDescriptor cursorDesc{
+            .nextInChain = &cursorWgsl, .label = "VR cursor"};
+        g_cursorShader = device.CreateShaderModule(&cursorDesc);
         const wgpu::SamplerDescriptor samplerDesc{
             .label = "VR eye blit sampler",
             .magFilter = wgpu::FilterMode::Linear,
@@ -219,20 +333,23 @@ const wgpu::RenderPipeline& blit_pipeline(const wgpu::Device& device, wgpu::Text
         };
         g_blitSampler = device.CreateSampler(&samplerDesc);
     }
+    const wgpu::ShaderModule& shader = kind == BlitKind::HudCompose ? g_hudShader :
+                                       kind == BlitKind::Cursor     ? g_cursorShader :
+                                                                      g_blitShader;
     const wgpu::ColorTargetState target{.format = format};
     const wgpu::FragmentState fragment{
-        .module = g_blitShader,
+        .module = shader,
         .entryPoint = is_srgb(format) ? "fs_srgb" : "fs_unorm",
         .targetCount = 1,
         .targets = &target,
     };
     const wgpu::RenderPipelineDescriptor desc{
-        .label = "VR eye blit",
-        .vertex = {.module = g_blitShader, .entryPoint = "vs_main"},
+        .label = "VR blit",
+        .vertex = {.module = shader, .entryPoint = "vs_main"},
         .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList},
         .fragment = &fragment,
     };
-    g_blitPipelines.push_back({format, device.CreateRenderPipeline(&desc)});
+    g_blitPipelines.push_back({kind, format, device.CreateRenderPipeline(&desc)});
     return g_blitPipelines.back().pipeline;
 }
 
@@ -405,6 +522,75 @@ bool create_action_spaces() {
     return true;
 }
 
+bool create_swapchain(Swapchain& sc, uint32_t width, uint32_t height, int64_t format,
+    const char* label) {
+    sc.width = width;
+    sc.height = height;
+    sc.dxgiFormat = static_cast<DXGI_FORMAT>(format);
+    sc.format = to_wgpu_format(format);
+
+    XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+                      XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    info.format = format;
+    info.sampleCount = 1;
+    info.width = width;
+    info.height = height;
+    info.faceCount = 1;
+    info.arraySize = 1;
+    info.mipCount = 1;
+    XR_TRY(xrCreateSwapchain(g_session, &info, &sc.handle));
+
+    uint32_t imageCount = 0;
+    XR_TRY(xrEnumerateSwapchainImages(sc.handle, 0, &imageCount, nullptr));
+    std::vector<XrSwapchainImageD3D12KHR> images(imageCount, {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+    XR_TRY(xrEnumerateSwapchainImages(sc.handle, imageCount, &imageCount,
+        reinterpret_cast<XrSwapchainImageBaseHeader*>(images.data())));
+    for (const auto& image : images) {
+        sc.images.push_back(image.texture);
+    }
+
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = sc.dxgiFormat;
+    desc.SampleDesc.Count = 1;
+    desc.Flags =
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+    if (FAILED(g_d3dDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc,
+            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&sc.staging))))
+    {
+        Log.error("Failed to create the {} staging texture", label);
+        return false;
+    }
+
+    dawn::native::d3d12::SharedTextureMemoryD3D12ResourceDescriptor d3dDesc;
+    d3dDesc.resource = sc.staging;
+    wgpu::SharedTextureMemoryDescriptor memDesc{};
+    memDesc.nextInChain = &d3dDesc;
+    memDesc.label = label;
+    sc.stagingMemory = aurora::xr::device().ImportSharedTextureMemory(&memDesc);
+    if (!sc.stagingMemory) {
+        Log.error("Failed to import the {} staging texture into WebGPU", label);
+        return false;
+    }
+    const wgpu::TextureDescriptor texDesc{
+        .label = label,
+        .usage = wgpu::TextureUsage::RenderAttachment,
+        .size = {width, height, 1},
+        .format = sc.format,
+    };
+    sc.stagingTexture = sc.stagingMemory.CreateTexture(&texDesc);
+    Log.info("{} swapchain: {}x{}, {} images, format {}", label, width, height, imageCount,
+        static_cast<int>(format));
+    return true;
+}
+
 bool create_swapchains() {
     uint32_t count = 0;
     XR_TRY(xrEnumerateSwapchainFormats(g_session, 0, &count, nullptr));
@@ -427,78 +613,23 @@ bool create_swapchains() {
     }
 
     const float scale = std::clamp(getSettings().vr.resolutionScale.getValue(), 0.3f, 2.0f);
-    const wgpu::Device device = aurora::xr::device();
     for (int eye = 0; eye < 2; ++eye) {
-        auto& sc = g_swapchains[eye];
-        sc.width = std::max(16u, static_cast<uint32_t>(
-                                     g_viewConfigs[eye].recommendedImageRectWidth * scale));
-        sc.height = std::max(16u, static_cast<uint32_t>(
-                                      g_viewConfigs[eye].recommendedImageRectHeight * scale));
-        sc.width = std::min(sc.width, g_viewConfigs[eye].maxImageRectWidth);
-        sc.height = std::min(sc.height, g_viewConfigs[eye].maxImageRectHeight);
-        sc.format = to_wgpu_format(chosen);
-
-        XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
-        info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-        info.format = chosen;
-        info.sampleCount = 1;
-        info.width = sc.width;
-        info.height = sc.height;
-        info.faceCount = 1;
-        info.arraySize = 1;
-        info.mipCount = 1;
-        XR_TRY(xrCreateSwapchain(g_session, &info, &sc.handle));
-
-        uint32_t imageCount = 0;
-        XR_TRY(xrEnumerateSwapchainImages(sc.handle, 0, &imageCount, nullptr));
-        std::vector<XrSwapchainImageD3D12KHR> images(
-            imageCount, {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
-        XR_TRY(xrEnumerateSwapchainImages(sc.handle, imageCount, &imageCount,
-            reinterpret_cast<XrSwapchainImageBaseHeader*>(images.data())));
-
-        for (const auto& image : images) {
-            sc.images.push_back(image.texture);
-        }
-        sc.dxgiFormat = static_cast<DXGI_FORMAT>(chosen);
-
-        D3D12_HEAP_PROPERTIES heap{};
-        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-        D3D12_RESOURCE_DESC desc{};
-        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        desc.Width = sc.width;
-        desc.Height = sc.height;
-        desc.DepthOrArraySize = 1;
-        desc.MipLevels = 1;
-        desc.Format = sc.dxgiFormat;
-        desc.SampleDesc.Count = 1;
-        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
-                     D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
-        if (FAILED(g_d3dDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc,
-                D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&sc.staging))))
+        const auto& view = g_viewConfigs[eye];
+        const uint32_t width = std::min(view.maxImageRectWidth,
+            std::max(16u, static_cast<uint32_t>(view.recommendedImageRectWidth * scale)));
+        const uint32_t height = std::min(view.maxImageRectHeight,
+            std::max(16u, static_cast<uint32_t>(view.recommendedImageRectHeight * scale)));
+        if (!create_swapchain(g_swapchains[eye], width, height, chosen,
+                eye == 0 ? "VR left eye" : "VR right eye"))
         {
-            Log.error("Failed to create the VR staging texture");
             return false;
         }
-
-        dawn::native::d3d12::SharedTextureMemoryD3D12ResourceDescriptor d3dDesc;
-        d3dDesc.resource = sc.staging;
-        wgpu::SharedTextureMemoryDescriptor memDesc{};
-        memDesc.nextInChain = &d3dDesc;
-        memDesc.label = "VR eye staging";
-        sc.stagingMemory = device.ImportSharedTextureMemory(&memDesc);
-        if (!sc.stagingMemory) {
-            Log.error("Failed to import the VR staging texture into WebGPU");
-            return false;
-        }
-        const wgpu::TextureDescriptor texDesc{
-            .label = "VR eye staging",
-            .usage = wgpu::TextureUsage::RenderAttachment,
-            .size = {sc.width, sc.height, 1},
-            .format = sc.format,
-        };
-        sc.stagingTexture = sc.stagingMemory.CreateTexture(&texDesc);
-        Log.info("Eye {} swapchain: {}x{}, {} images, format {}", eye, sc.width, sc.height,
-            imageCount, static_cast<int>(chosen));
+    }
+    // The HUD is drawn into the eye-sized framebuffer, so its panel matches that size.
+    if (!create_swapchain(g_hud, g_swapchains[0].width, g_swapchains[0].height, chosen, "VR HUD") ||
+        !create_swapchain(g_cursor, 64, 64, chosen, "VR cursor"))
+    {
+        return false;
     }
 
     if (FAILED(g_d3dDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_copyFence)))) {
@@ -518,7 +649,22 @@ bool create_swapchains() {
     return true;
 }
 
-// Copies each rendered eye's staging texture into its acquired swapchain image. Must run after the
+void record_copy(ID3D12GraphicsCommandList* list, Swapchain& sc) {
+    ID3D12Resource* image = sc.images[sc.acquired];
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = image;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    list->ResourceBarrier(1, &barrier);
+    // The staging texture allows simultaneous access, so it is promoted to COPY_SOURCE implicitly.
+    list->CopyResource(image, sc.staging.Get());
+    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    list->ResourceBarrier(1, &barrier);
+}
+
+// Copies each rendered staging texture into its acquired swapchain image. Must run after the
 // frames that rendered them were submitted, since it shares Dawn's queue.
 void copy_to_swapchains() {
     auto& ctx = g_copyContexts[g_copyIndex];
@@ -533,22 +679,17 @@ void copy_to_swapchains() {
     bool any = false;
     for (int eye = 0; eye < 2; ++eye) {
         auto& sc = g_swapchains[eye];
-        if (sc.acquired == UINT32_MAX || !g_eyeRendered[eye]) {
-            continue;
+        if (sc.acquired != UINT32_MAX && g_eyeRendered[eye]) {
+            record_copy(ctx.list.Get(), sc);
+            any = true;
         }
-        ID3D12Resource* image = sc.images[sc.acquired];
-        D3D12_RESOURCE_BARRIER barrier{};
-        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barrier.Transition.pResource = image;
-        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-        ctx.list->ResourceBarrier(1, &barrier);
-        // The staging texture allows simultaneous access, so it is promoted to COPY_SOURCE
-        // implicitly.
-        ctx.list->CopyResource(image, sc.staging.Get());
-        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
-        ctx.list->ResourceBarrier(1, &barrier);
+    }
+    if (g_hud.acquired != UINT32_MAX && g_hudRendered) {
+        record_copy(ctx.list.Get(), g_hud);
+        any = true;
+    }
+    if (g_cursor.acquired != UINT32_MAX && g_cursorRendered) {
+        record_copy(ctx.list.Get(), g_cursor);
         any = true;
     }
     ctx.list->Close();
@@ -625,6 +766,10 @@ void read_input() {
                 hand.velocityValid = true;
             }
         }
+        if (hand.active != g_input.hands[h].active) {
+            Log.info("{} controller {}", h == kLeft ? "Left" : "Right",
+                hand.active ? "tracked" : "lost");
+        }
         XrSpaceLocation aimLoc{XR_TYPE_SPACE_LOCATION};
         if (XR_SUCCEEDED(xrLocateSpace(g_aimSpaces[h], g_appSpace, time, &aimLoc)) &&
             (aimLoc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT))
@@ -639,7 +784,7 @@ void read_input() {
 
 void destroy_session() {
     aurora::xr::synchronize();
-    for (auto& sc : g_swapchains) {
+    const auto destroy = [](Swapchain& sc) {
         sc.stagingTexture = {};
         sc.stagingMemory = {};
         sc.staging.Reset();
@@ -648,7 +793,17 @@ void destroy_session() {
             xrDestroySwapchain(sc.handle);
         }
         sc = {};
+    };
+    for (auto& sc : g_swapchains) {
+        destroy(sc);
     }
+    destroy(g_hud);
+    destroy(g_cursor);
+    g_cursorValid = false;
+    g_cursorRendered = false;
+    g_hudBlack = {};
+    g_hudValid = false;
+    g_hudRendered = false;
     for (int h = 0; h < 2; ++h) {
         if (g_gripSpaces[h] != XR_NULL_HANDLE) {
             xrDestroySpace(g_gripSpaces[h]);
@@ -919,6 +1074,7 @@ bool begin_frame() {
 }
 
 bool should_render() { return g_frameBegun && g_frameState.shouldRender && g_viewsValid; }
+bool views_valid() { return g_frameBegun && g_viewsValid; }
 
 const EyeView& eye(int index) { return g_eyes[index]; }
 const Pose& head() { return g_head; }
@@ -992,6 +1148,174 @@ void render_eye(int index) {
         });
 }
 
+void render_hud(int phase) {
+    if (phase == 0) {
+        // Keep the over-black pass for the compose step.
+        aurora::xr::set_next_frame_hook([](wgpu::CommandEncoder& encoder,
+                                             const aurora::xr::PresentSource& source,
+                                             std::vector<aurora::xr::AfterSubmitCallback>&) {
+            const wgpu::Device device = aurora::xr::device();
+            if (!g_hudBlack || g_hudBlack.GetWidth() != source.width ||
+                g_hudBlack.GetHeight() != source.height || g_hudBlack.GetFormat() != source.format)
+            {
+                const wgpu::TextureDescriptor desc{
+                    .label = "VR HUD over black",
+                    .usage = wgpu::TextureUsage::RenderAttachment |
+                             wgpu::TextureUsage::TextureBinding,
+                    .size = {source.width, source.height, 1},
+                    .format = source.format,
+                };
+                g_hudBlack = device.CreateTexture(&desc);
+            }
+            const auto& pipeline = blit_pipeline(device, source.format);
+            const wgpu::BindGroupEntry entries[] = {
+                {.binding = 0, .textureView = source.view},
+                {.binding = 1, .sampler = g_blitSampler},
+            };
+            const wgpu::BindGroupDescriptor bindDesc{
+                .layout = pipeline.GetBindGroupLayout(0),
+                .entryCount = 2,
+                .entries = entries,
+            };
+            const wgpu::RenderPassColorAttachment attachment{
+                .view = g_hudBlack.CreateView(),
+                .loadOp = wgpu::LoadOp::Clear,
+                .storeOp = wgpu::StoreOp::Store,
+            };
+            const wgpu::RenderPassDescriptor passDesc{
+                .label = "VR HUD capture",
+                .colorAttachmentCount = 1,
+                .colorAttachments = &attachment,
+            };
+            const auto pass = encoder.BeginRenderPass(&passDesc);
+            pass.SetPipeline(pipeline);
+            pass.SetBindGroup(0, device.CreateBindGroup(&bindDesc));
+            pass.Draw(3);
+            pass.End();
+        });
+        return;
+    }
+
+    if (g_hud.handle == XR_NULL_HANDLE || g_hud.acquired != UINT32_MAX) {
+        return;
+    }
+    uint32_t image = 0;
+    XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    if (XR_FAILED(xrAcquireSwapchainImage(g_hud.handle, &acquire, &image))) {
+        return;
+    }
+    XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wait.timeout = XR_INFINITE_DURATION;
+    if (XR_FAILED(xrWaitSwapchainImage(g_hud.handle, &wait))) {
+        XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        xrReleaseSwapchainImage(g_hud.handle, &release);
+        return;
+    }
+    g_hud.acquired = image;
+    g_hudRendered = true;
+
+    // The cursor image is drawn once, alongside the first HUD.
+    bool drawCursor = false;
+    if (!g_cursorValid && g_cursor.handle != XR_NULL_HANDLE && g_cursor.acquired == UINT32_MAX) {
+        uint32_t cursorImage = 0;
+        if (XR_SUCCEEDED(xrAcquireSwapchainImage(g_cursor.handle, &acquire, &cursorImage)) &&
+            XR_SUCCEEDED(xrWaitSwapchainImage(g_cursor.handle, &wait)))
+        {
+            g_cursor.acquired = cursorImage;
+            g_cursorRendered = true;
+            drawCursor = true;
+        }
+    }
+
+    aurora::xr::set_next_frame_hook(
+        [target = g_hud.stagingTexture, memory = g_hud.stagingMemory, format = g_hud.format,
+            drawCursor, cursorTarget = g_cursor.stagingTexture,
+            cursorMemory = g_cursor.stagingMemory, cursorFormat = g_cursor.format](
+            wgpu::CommandEncoder& encoder, const aurora::xr::PresentSource& source,
+            std::vector<aurora::xr::AfterSubmitCallback>& afterSubmit) {
+            const wgpu::Device device = aurora::xr::device();
+            if (drawCursor) {
+                wgpu::SharedTextureMemoryBeginAccessDescriptor cursorBegin{};
+                cursorBegin.initialized = false;
+                cursorBegin.fenceCount = 0;
+                if (cursorMemory.BeginAccess(cursorTarget, &cursorBegin) == wgpu::Status::Success) {
+                    const wgpu::RenderPassColorAttachment attachment{
+                        .view = cursorTarget.CreateView(),
+                        .loadOp = wgpu::LoadOp::Clear,
+                        .storeOp = wgpu::StoreOp::Store,
+                        .clearValue = {0.0, 0.0, 0.0, 0.0},
+                    };
+                    const wgpu::RenderPassDescriptor passDesc{
+                        .label = "VR cursor",
+                        .colorAttachmentCount = 1,
+                        .colorAttachments = &attachment,
+                    };
+                    const auto pass = encoder.BeginRenderPass(&passDesc);
+                    pass.SetPipeline(blit_pipeline(device, cursorFormat, BlitKind::Cursor));
+                    pass.Draw(3);
+                    pass.End();
+                    afterSubmit.push_back([cursorTarget, cursorMemory] {
+                        wgpu::SharedTextureMemoryEndAccessState state;
+                        cursorMemory.EndAccess(cursorTarget, &state);
+                    });
+                }
+            }
+            if (!g_hudBlack) {
+                return;
+            }
+            wgpu::SharedTextureMemoryBeginAccessDescriptor begin{};
+            begin.initialized = false;
+            begin.fenceCount = 0;
+            if (memory.BeginAccess(target, &begin) != wgpu::Status::Success) {
+                Log.error("BeginAccess on the VR HUD texture failed");
+                return;
+            }
+            const auto& pipeline = blit_pipeline(device, format, BlitKind::HudCompose);
+            const wgpu::BindGroupEntry entries[] = {
+                {.binding = 0, .textureView = g_hudBlack.CreateView()},
+                {.binding = 1, .textureView = source.view},
+                {.binding = 2, .sampler = g_blitSampler},
+            };
+            const wgpu::BindGroupDescriptor bindDesc{
+                .layout = pipeline.GetBindGroupLayout(0),
+                .entryCount = 3,
+                .entries = entries,
+            };
+            const wgpu::RenderPassColorAttachment attachment{
+                .view = target.CreateView(),
+                .loadOp = wgpu::LoadOp::Clear,
+                .storeOp = wgpu::StoreOp::Store,
+                .clearValue = {0.0, 0.0, 0.0, 0.0},
+            };
+            const wgpu::RenderPassDescriptor passDesc{
+                .label = "VR HUD compose",
+                .colorAttachmentCount = 1,
+                .colorAttachments = &attachment,
+            };
+            const auto pass = encoder.BeginRenderPass(&passDesc);
+            pass.SetPipeline(pipeline);
+            pass.SetBindGroup(0, device.CreateBindGroup(&bindDesc));
+            pass.Draw(3);
+            pass.End();
+            afterSubmit.push_back([target, memory] {
+                wgpu::SharedTextureMemoryEndAccessState state;
+                memory.EndAccess(target, &state);
+            });
+        });
+}
+
+void set_cursor(bool visible, const Pose& pose, float sizeMeters) {
+    g_cursorVisible = visible;
+    g_cursorPose = pose;
+    g_cursorSize = sizeMeters;
+}
+
+void set_hud_pose(const Pose& pose, float widthMeters, float heightMeters) {
+    g_hudPose = pose;
+    g_hudWidth = widthMeters;
+    g_hudHeight = heightMeters;
+}
+
 void end_frame() {
     if (!g_frameBegun) {
         return;
@@ -999,6 +1323,20 @@ void end_frame() {
     // Swapchain images must be released only after the frames that wrote them are submitted.
     aurora::xr::synchronize();
     copy_to_swapchains();
+    if (g_hud.acquired != UINT32_MAX) {
+        XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        xrReleaseSwapchainImage(g_hud.handle, &release);
+        g_hud.acquired = UINT32_MAX;
+        g_hudValid = g_hudValid || g_hudRendered;
+        g_hudRendered = false;
+    }
+    if (g_cursor.acquired != UINT32_MAX) {
+        XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        xrReleaseSwapchainImage(g_cursor.handle, &release);
+        g_cursor.acquired = UINT32_MAX;
+        g_cursorValid = g_cursorValid || g_cursorRendered;
+        g_cursorRendered = false;
+    }
 
     std::array<XrCompositionLayerProjectionView, 2> projViews{};
     bool allRendered = true;
@@ -1022,14 +1360,46 @@ void end_frame() {
     layer.space = g_appSpace;
     layer.viewCount = 2;
     layer.views = projViews.data();
-    const XrCompositionLayerBaseHeader* layers[] = {
-        reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer)};
+    XrCompositionLayerQuad hudLayer{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    hudLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    hudLayer.space = g_appSpace;
+    hudLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    hudLayer.subImage.swapchain = g_hud.handle;
+    hudLayer.subImage.imageRect.extent = {
+        static_cast<int32_t>(g_hud.width), static_cast<int32_t>(g_hud.height)};
+    hudLayer.pose.orientation = {g_hudPose.orientation.x, g_hudPose.orientation.y,
+        g_hudPose.orientation.z, g_hudPose.orientation.w};
+    hudLayer.pose.position = {g_hudPose.position.x, g_hudPose.position.y, g_hudPose.position.z};
+    hudLayer.size = {g_hudWidth, g_hudHeight};
+
+    XrCompositionLayerQuad cursorLayer{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    cursorLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    cursorLayer.space = g_appSpace;
+    cursorLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    cursorLayer.subImage.swapchain = g_cursor.handle;
+    cursorLayer.subImage.imageRect.extent = {
+        static_cast<int32_t>(g_cursor.width), static_cast<int32_t>(g_cursor.height)};
+    cursorLayer.pose.orientation = {g_cursorPose.orientation.x, g_cursorPose.orientation.y,
+        g_cursorPose.orientation.z, g_cursorPose.orientation.w};
+    cursorLayer.pose.position = {
+        g_cursorPose.position.x, g_cursorPose.position.y, g_cursorPose.position.z};
+    cursorLayer.size = {g_cursorSize, g_cursorSize};
+
+    const XrCompositionLayerBaseHeader* layers[3];
+    uint32_t layerCount = 0;
+    layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer);
+    if (g_hudValid) {
+        layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&hudLayer);
+        if (g_cursorValid && g_cursorVisible) {
+            layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&cursorLayer);
+        }
+    }
 
     XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
     endInfo.displayTime = g_frameState.predictedDisplayTime;
     endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     const bool submit = should_render() && allRendered;
-    endInfo.layerCount = submit ? 1 : 0;
+    endInfo.layerCount = submit ? layerCount : 0;
     endInfo.layers = submit ? layers : nullptr;
     if (const XrResult res = xrEndFrame(g_session, &endInfo); XR_FAILED(res)) {
         Log.warn("xrEndFrame failed: {}", result_string(res));

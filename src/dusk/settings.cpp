@@ -207,6 +207,13 @@ UserSettings g_userSettings = {
         .handOffsetPitch {"vr.handOffsetPitch", 0.0f},
         .handOffsetYaw {"vr.handOffsetYaw", 0.0f},
         .handOffsetRoll {"vr.handOffsetRoll", 0.0f},
+        .shieldOffsetPitch {"vr.shieldOffsetPitch", 0.0f},
+        .shieldOffsetYaw {"vr.shieldOffsetYaw", 0.0f},
+        .shieldOffsetRoll {"vr.shieldOffsetRoll", 0.0f},
+        .hudDistance {"vr.hudDistance", 1.5f},
+        .hudWidth {"vr.hudWidth", 1.5f},
+        .hudHeight {"vr.hudHeight", -0.1f},
+        .mirror {"vr.mirror", 0},
     },
 
     // Not sure if there's a better way to declare this
@@ -437,6 +444,13 @@ void registerSettings() {
     Register(g_userSettings.vr.handOffsetPitch);
     Register(g_userSettings.vr.handOffsetYaw);
     Register(g_userSettings.vr.handOffsetRoll);
+    Register(g_userSettings.vr.shieldOffsetPitch);
+    Register(g_userSettings.vr.shieldOffsetYaw);
+    Register(g_userSettings.vr.shieldOffsetRoll);
+    Register(g_userSettings.vr.hudDistance);
+    Register(g_userSettings.vr.hudWidth);
+    Register(g_userSettings.vr.hudHeight);
+    Register(g_userSettings.vr.mirror);
     Register(g_userSettings.backend.isoVerification);
     Register(g_userSettings.backend.graphicsBackend);
     Register(g_userSettings.backend.skipPreLaunchUI);

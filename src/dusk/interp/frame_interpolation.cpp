@@ -40,11 +40,27 @@ Recording s_currentRecording;
 Recording s_previousRecording;
 
 absl::flat_hash_map<uintptr_t, Mtx> g_replacements;
+absl::flat_hash_map<uintptr_t, Mtx> g_presentationOverrides;
+
+bool find_override(const void* key, Mtx out) {
+    if (g_presentationOverrides.empty() || key == nullptr) {
+        return false;
+    }
+    auto it = g_presentationOverrides.find(reinterpret_cast<uintptr_t>(key));
+    if (it == g_presentationOverrides.end()) {
+        return false;
+    }
+    MTXCopy(it->second, out);
+    return true;
+}
 
 int s_presentationDepth = 0;
 bool s_cameraPresentationActive = false;
 
 const Mtx* resolve_replacement(const Mtx* source, Mtx* scratch) {
+    if (find_override(source, *scratch)) {
+        return scratch;
+    }
     if (!s_replacementsActive || source == nullptr || dusk::interp::presentation_sync_active()) {
         return source;
     }
@@ -220,6 +236,9 @@ void forget_mtx(const void* key) {
 }
 
 bool lookup_replacement(const void* key, Mtx out) {
+    if (find_override(key, out)) {
+        return true;
+    }
     if (presentation_sync_active() || !s_replacementsActive || key == nullptr) {
         return false;
     }
@@ -284,6 +303,14 @@ void end_presentation() {
         camera_restore_presentation();
         s_cameraPresentationActive = false;
     }
+    g_presentationOverrides.clear();
+}
+
+void set_presentation_override(const void* key, const Mtx m) {
+    if (key == nullptr) {
+        return;
+    }
+    MTXCopy(m, g_presentationOverrides[reinterpret_cast<uintptr_t>(key)]);
 }
 
 bool is_presentation_active() {

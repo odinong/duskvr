@@ -7,10 +7,18 @@ struct view_class;
 
 // Stereo 6DoF VR on top of the frame-interpolation presentation path.
 //
-// Each headset frame runs the simulation as usual, then presents the scene once per eye. The
-// per-eye camera replaces the interpolated game camera inside dusk::interp's presentation, so
-// everything the game draws during presentation (world, particles, HUD) lands in that eye.
+// Each headset frame runs the simulation as usual, then presents the 3D scene once per eye. The
+// per-eye camera replaces the interpolated game camera inside dusk::interp's presentation. The 2D
+// HUD is drawn separately after each simulation tick and shown on a floating panel.
 namespace dusk::vr {
+
+// What the current aurora frame is drawing.
+enum class Pass {
+    Flat,      // not in VR
+    Eye,       // 3D scene for one eye, no HUD
+    HudBlack,  // HUD only, over black
+    HudWhite,  // HUD only, over white
+};
 
 #if DUSK_VR
 // Creates the OpenXR instance/session if VR is enabled and a headset is present. Call once after
@@ -26,7 +34,13 @@ bool active();
 bool begin_frame();
 int eye_count();
 void begin_eye(int eye);
+// The HUD is redrawn after simulation ticks: two extra frames, over black then over white.
+bool hud_pending();
+void begin_hud(int phase);
 void end_frame();
+Pass render_pass();
+// The background the frame after this one needs (HUD passes), as a gray level.
+bool next_frame_clear(u8& level);
 
 // Simulation tick hooks.
 void before_sim_tick();  // pushes controller state into the virtual pad
@@ -52,7 +66,11 @@ inline bool active() { return false; }
 inline bool begin_frame() { return false; }
 inline int eye_count() { return 0; }
 inline void begin_eye(int) {}
+inline bool hud_pending() { return false; }
+inline void begin_hud(int) {}
 inline void end_frame() {}
+inline Pass render_pass() { return Pass::Flat; }
+inline bool next_frame_clear(u8&) { return false; }
 inline void before_sim_tick() {}
 inline void after_sim_tick() {}
 inline bool apply_eye_view(view_class*, float) { return false; }

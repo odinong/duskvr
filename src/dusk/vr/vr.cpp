@@ -1,6 +1,8 @@
 #include "dusk/vr/vr.h"
 
+#include "dusk/interp/frame_interpolation.h"
 #include "dusk/logging.h"
+#include "dusk/menu_pointer.h"
 #include "dusk/settings.h"
 #include "dusk/config.hpp"
 #include "dusk/vr/vr_input.h"
@@ -17,11 +19,13 @@
 #include "m_Do/m_Do_lib.h"
 
 #include <aurora/aurora.h>
+#include <aurora/rmlui.hpp>
 #include <aurora/gfx.h>
 #include <aurora/xr.hpp>
 #include <imgui.h>
 
 #include <algorithm>
+#include <cstring>
 #include <cmath>
 
 namespace dusk::vr {
@@ -30,14 +34,42 @@ namespace {
 constexpr borealis::Log Log{"vr"};
 
 // Human Link's hand joints and the item joints parented to them. Link is left handed: the sword
-// sits in the left hand, the shield in the right.
+// sits in the left hand, the shield in the right. The hand model's joints 1 and 2 copy the hands.
 constexpr int kSwordHandJoint = 9;
 constexpr int kSwordItemJoint = 10;
 constexpr int kShieldHandJoint = 14;
 constexpr int kShieldItemJoint = 15;
+constexpr int kSwordHandModelJoint = 1;
+constexpr int kShieldHandModelJoint = 2;
+
+// Item joint axes in the controller's grip frame: the blade runs along the item joint's +X (the
+// game puts the sword tip at +X), its edges face +/-Z. A sword held like the controller points
+// forward (-Z) with its edges up and down (+/-Y).
+constexpr Quat kItemFromGrip{-0.5f, 0.5f, 0.5f, 0.5f};
+
+// Where each held item was placed at the last sim tick, so presentation can move it to where the
+// controller is now.
+struct HandPlacement {
+    bool valid = false;
+    Mtx simTarget;
+};
+HandPlacement g_placements[2];
+
+void latch_hands(daAlink_c* link, float step);
 
 bool g_initialized = false;
 bool g_active = false;
+Pass g_pass = Pass::Flat;
+bool g_hudPending = true;
+bool g_hudPlaced = false;
+float g_hudYaw = 0.f;
+bool g_hudFollowing = false;
+Vec3 g_hudAnchor;
+Pose g_hudPose;
+float g_hudWidth = 1.5f;
+float g_hudHeight = 0.84f;
+bool g_pointerDown = false;
+bool g_pointerOnPanel = false;
 bool g_frameOpen = false;
 int g_currentEye = -1;
 bool g_prevPauseOnFocusLost = true;
@@ -58,6 +90,10 @@ bool g_wasWolf = false;
 // Player state sampled at the end of each sim tick, where the game's systems are consistent.
 bool g_controllable = false;
 bool g_locked = false;
+bool g_bowReady = false;
+int g_bowSlot = 0;
+bool g_prevSwordHit = false;
+bool g_prevDamaged = false;
 
 double g_lastDisplayTime = 0.0;
 bool g_firstPersonFrame = false;
@@ -175,11 +211,21 @@ void build_world_matrix(Mtx out, const Quat& rot, const Vec3& pos) {
     out[2][0] = r.z; out[2][1] = u.z; out[2][2] = b.z; out[2][3] = pos.z;
 }
 
-Quat hand_offset() {
+Quat euler_offset(float pitch, float yaw, float roll) {
+    return Quat::yaw(deg2rad(yaw)) * Quat::axisAngle({1.f, 0.f, 0.f}, deg2rad(pitch)) *
+           Quat::axisAngle({0.f, 0.f, 1.f}, deg2rad(roll));
+}
+
+Quat item_offset(xr::Hand hand) {
     const auto& vr = getSettings().vr;
-    return Quat::yaw(deg2rad(vr.handOffsetYaw.getValue())) *
-           Quat::axisAngle({1.f, 0.f, 0.f}, deg2rad(vr.handOffsetPitch.getValue())) *
-           Quat::axisAngle({0.f, 0.f, 1.f}, deg2rad(vr.handOffsetRoll.getValue()));
+    if (hand == input::sword_hand()) {
+        return euler_offset(vr.handOffsetPitch.getValue(), vr.handOffsetYaw.getValue(),
+                   vr.handOffsetRoll.getValue()) *
+               kItemFromGrip;
+    }
+    return euler_offset(vr.shieldOffsetPitch.getValue(), vr.shieldOffsetYaw.getValue(),
+               vr.shieldOffsetRoll.getValue()) *
+           kItemFromGrip;
 }
 
 // Maps a tracking-space point to the world, anchored at Link (first person).
@@ -190,6 +236,103 @@ Vec3 tracking_to_world_fp(const Vec3& p, const Vec3& anchor) {
 
 Vec3 first_person_anchor(const cXyz& feet, float eyeHeight) {
     return {feet.x, feet.y + eyeHeight + getSettings().vr.heightOffset.getValue(), feet.z};
+}
+
+// The HUD panel floats in front of you and lazily turns to follow your gaze, so it stays readable
+// without being glued to your face. It holds still while a menu is open.
+void update_hud_pose(float dt, bool paused) {
+    if (!xr::head_valid()) {
+        return;
+    }
+    const Pose& head = xr::head();
+    const float headYaw = yaw_of(head.forward());
+    if (!g_hudPlaced) {
+        g_hudYaw = headYaw;
+        g_hudAnchor = head.position;
+        g_hudPlaced = true;
+    } else if (!paused) {
+        const float diff = wrap_pi(headYaw - g_hudYaw);
+        if (std::fabs(diff) > deg2rad(35.f)) {
+            g_hudFollowing = true;
+        } else if (std::fabs(diff) < deg2rad(3.f)) {
+            g_hudFollowing = false;
+        }
+        if (g_hudFollowing) {
+            g_hudYaw = wrap_pi(g_hudYaw + diff * std::min(1.f, dt * 4.f));
+        }
+        const float k = std::min(1.f, dt * 2.f);
+        g_hudAnchor = g_hudAnchor + (head.position - g_hudAnchor) * k;
+    }
+
+    const auto& vr = getSettings().vr;
+    const float width = std::clamp(vr.hudWidth.getValue(), 0.3f, 4.f);
+    const float distance = std::clamp(vr.hudDistance.getValue(), 0.4f, 5.f);
+    Pose pose;
+    pose.orientation = Quat::yaw(g_hudYaw);
+    pose.position = g_hudAnchor + pose.orientation.rotate({0.f, 0.f, -distance});
+    pose.position.y = g_hudAnchor.y + vr.hudHeight.getValue();
+    g_hudPose = pose;
+    g_hudWidth = width;
+    g_hudHeight = width * 9.f / 16.f;
+    xr::set_hud_pose(pose, g_hudWidth, g_hudHeight);
+}
+
+// In menus, the sword hand is a laser pointer onto the HUD panel; the trigger clicks.
+void update_pointer() {
+    const auto& in = xr::input();
+    const xr::Hand handIdx = input::sword_hand();
+    const auto& hand = in.hands[handIdx];
+    bool onPanel = false;
+    float u = 0.f, v = 0.f;
+    Pose hit;
+    if (menu_pointer::enabled() && menu_pointer::active() && hand.active) {
+        const Vec3 origin = hand.aim.position;
+        const Vec3 dir = hand.aim.forward();
+        const Vec3 normal = g_hudPose.orientation.rotate({0.f, 0.f, 1.f});
+        const float denom = dir.dot(normal);
+        if (denom < -1e-4f) {
+            const float t = (g_hudPose.position - origin).dot(normal) / denom;
+            if (t > 0.f) {
+                const Vec3 point = origin + dir * t;
+                const Vec3 local = g_hudPose.orientation.conjugate().rotate(point - g_hudPose.position);
+                u = local.x / g_hudWidth + 0.5f;
+                v = 0.5f - local.y / g_hudHeight;
+                onPanel = u >= 0.f && u <= 1.f && v >= 0.f && v <= 1.f;
+                hit.orientation = g_hudPose.orientation;
+                hit.position = point + normal * 0.005f;
+            }
+        }
+    }
+
+    auto* context = aurora::rmlui::get_context();
+    if (!onPanel || context == nullptr) {
+        if (g_pointerDown) {
+            menu_pointer::handle_fallthrough_pointer(0.f, 0.f, menu_pointer::Phase::Cancel, true);
+            g_pointerDown = false;
+        }
+        g_pointerOnPanel = false;
+        input::set_pointer_captured(false);
+        xr::set_cursor(false, {}, 0.f);
+        return;
+    }
+
+    // The pointer speaks in UI (RmlUi) coordinates, which span the game's 2D screen.
+    const auto dims = context->GetDimensions();
+    const float x = u * static_cast<float>(dims.x);
+    const float y = v * static_cast<float>(dims.y);
+    const bool trigger = in.trigger[handIdx] > 0.6f;
+    menu_pointer::Phase phase = menu_pointer::Phase::Move;
+    if (trigger && !g_pointerDown) {
+        phase = menu_pointer::Phase::Press;
+        xr::haptic(handIdx, 0.3f, 0.02f);
+    } else if (!trigger && g_pointerDown) {
+        phase = menu_pointer::Phase::Release;
+    }
+    menu_pointer::handle_fallthrough_pointer(x, y, phase, true);
+    g_pointerDown = trigger;
+    g_pointerOnPanel = true;
+    input::set_pointer_captured(true);
+    xr::set_cursor(true, hit, 0.02f * g_hudWidth / 1.5f);
 }
 
 }  // namespace
@@ -230,6 +373,7 @@ void recenter() {
         g_yawOffset = 0.f;
     }
     g_needsRecenter = false;
+    g_hudPlaced = false;
     Log.info("Recentered");
 }
 
@@ -267,11 +411,16 @@ bool begin_frame() {
     g_ctx.gameplay = g_controllable;
     g_ctx.firstPerson = g_firstPersonFrame;
     g_ctx.locked = g_locked;
+    g_ctx.bowReady = g_bowReady;
+    g_ctx.bowSlot = g_bowSlot;
     g_ctx.standingHeight = g_standingHeight;
 
     if (g_needsRecenter && g_linkValid) {
         recenter();
     }
+
+    update_hud_pose(dt, dMeter2Info_getPauseStatus() != 0);
+    update_pointer();
 
     const auto result = input::update_frame(xr::input(), xr::head(), dt, g_ctx);
     turn(result.turnRad);
@@ -285,16 +434,47 @@ bool begin_frame() {
     return true;
 }
 
-int eye_count() { return g_frameOpen && xr::should_render() ? 2 : 0; }
+// Eyes are drawn whenever tracking is valid, even if the runtime won't show them (headset off
+// the head), so the desktop mirror keeps working. end_frame only submits what is visible.
+int eye_count() { return g_frameOpen && xr::views_valid() ? 2 : 0; }
 
 void begin_eye(int eye) {
+    g_pass = Pass::Eye;
     g_currentEye = eye;
     xr::render_eye(eye);
     // Mirror the last eye to the desktop window; never block on the window's vsync.
-    aurora::xr::set_next_frame_window_present(eye == 1);
+    aurora::xr::set_next_frame_window_present(eye == 1 && getSettings().vr.mirror.getValue() == 0);
+}
+
+bool hud_pending() { return g_hudPending; }
+
+void begin_hud(int phase) {
+    g_pass = phase == 0 ? Pass::HudBlack : Pass::HudWhite;
+    g_currentEye = -1;
+    xr::render_hud(phase);
+    aurora::xr::set_next_frame_window_present(phase != 0 && getSettings().vr.mirror.getValue() == 1);
+    if (phase != 0) {
+        g_hudPending = false;
+    }
+}
+
+Pass render_pass() { return g_pass; }
+
+bool next_frame_clear(u8& level) {
+    // Frame order: eye 0, eye 1, then (after a sim tick) HUD over black, HUD over white.
+    if (g_pass == Pass::Eye && g_currentEye == 1 && g_hudPending) {
+        level = 0;
+        return true;
+    }
+    if (g_pass == Pass::HudBlack) {
+        level = 255;
+        return true;
+    }
+    return false;
 }
 
 void end_frame() {
+    g_pass = Pass::Flat;
     if (!g_frameOpen) {
         return;
     }
@@ -336,12 +516,34 @@ void before_sim_tick() {
 }
 
 void after_sim_tick() {
+    // The HUD only changes when the game does.
+    g_hudPending = true;
     daAlink_c* link = get_link();
     if (link == nullptr) {
         g_linkValid = false;
         g_controllable = false;
         g_locked = false;
+        g_bowReady = false;
         return;
+    }
+    g_bowReady = !link->checkWolf() && link->checkBowAndSlingItem(link->mEquipItem) &&
+                 link->checkBowAnime();
+    g_bowSlot = link->mSelectItemId;
+
+    // Feel what Link feels: the blade connecting, and getting hurt.
+    if (g_active) {
+        const bool swordHit = link->mAtCps[0].ChkAtHit() || link->mAtCps[1].ChkAtHit() ||
+                              link->mAtCps[2].ChkAtHit();
+        if (swordHit && !g_prevSwordHit) {
+            xr::haptic(input::sword_hand(), 1.f, 0.08f);
+        }
+        g_prevSwordHit = swordHit;
+        const bool damaged = link->mDamageTimer != 0;
+        if (damaged && !g_prevDamaged) {
+            xr::haptic(xr::kLeft, 0.9f, 0.2f);
+            xr::haptic(xr::kRight, 0.9f, 0.2f);
+        }
+        g_prevDamaged = damaged;
     }
     g_controllable = player_controllable(link);
     const daPy_py_c* player = link;
@@ -392,6 +594,12 @@ bool apply_eye_view(view_class* view, float step) {
         eyeRot = Quat::yaw(base) * eye.pose.orientation;
     }
 
+    if (g_firstPersonFrame && getSettings().vr.motionControls) {
+        if (daAlink_c* link = get_link(); link != nullptr && !link->checkWolf()) {
+            latch_hands(link, step);
+        }
+    }
+
     build_view_matrix(view->viewMtx, eyeRot, eyePos);
     const Vec3 fwd = eyeRot.rotate({0.f, 0.f, -1.f});
     const Vec3 up = eyeRot.rotate({0.f, 1.f, 0.f});
@@ -426,7 +634,6 @@ bool apply_eye_view(view_class* view, float step) {
         Z2GetAudience()->setAudioCamera(view->viewMtx, view->lookat.eye, view->lookat.center,
             view->fovy, view->aspect, false, 0, false);
     }
-    (void)step;
     return true;
 }
 
@@ -467,39 +674,115 @@ void override_link_hands(daAlink_c* link) {
     }
     const auto& in = xr::input();
     const Vec3 anchor = first_person_anchor(link->current.pos, g_eyeHeightCurr);
-    const Quat offset = hand_offset();
 
+    // The controller holds the item joint (where the game attaches the sword, shield or tool);
+    // the hand follows it rigidly.
     const auto place = [&](xr::Hand hand, int handJoint, int itemJoint) {
         const auto& state = in.hands[hand];
+        g_placements[hand].valid = false;
         if (!state.active) {
             return;
         }
-        Mtx target;
-        build_world_matrix(target, Quat::yaw(g_yawOffset) * state.grip.orientation * offset,
+        Mtx& target = g_placements[hand].simTarget;
+        build_world_matrix(target, Quat::yaw(g_yawOffset) * state.grip.orientation * item_offset(hand),
             tracking_to_world_fp(state.grip.position, anchor));
 
-        MtxP current = link->mpLinkModel->getAnmMtx(handJoint);
         MtxP item = link->mpLinkModel->getAnmMtx(itemJoint);
+        MtxP handMtx = link->mpLinkModel->getAnmMtx(handJoint);
         Mtx inv, delta, moved;
-        MTXInverse(current, inv);
+        MTXInverse(item, inv);
         MTXConcat(target, inv, delta);
-        MTXConcat(delta, item, moved);
-        MTXCopy(moved, item);
-        MTXCopy(target, current);
+        MTXConcat(delta, handMtx, moved);
+        MTXCopy(moved, handMtx);
+        MTXCopy(target, item);
+        g_placements[hand].valid = true;
     };
     place(input::sword_hand(), kSwordHandJoint, kSwordItemJoint);
     place(input::shield_hand(), kShieldHandJoint, kShieldItemJoint);
 }
 
+namespace {
+
+bool attached_to(J3DModel* model, MtxP joint) {
+    return model != nullptr && std::memcmp(model->getBaseTRMtx(), joint, sizeof(Mtx)) == 0;
+}
+
+void override_model(J3DModel* model, const Mtx delta) {
+    const u16 joints = model->getModelData()->getJointNum();
+    for (u16 i = 0; i < joints; ++i) {
+        Mtx m;
+        MTXConcat(delta, model->getAnmMtx(i), m);
+        interp::set_presentation_override(model->getAnmMtx(i), m);
+    }
+    const u16 weights = model->getModelData()->getWEvlpMtxNum();
+    for (u16 i = 0; i < weights; ++i) {
+        Mtx m;
+        MTXConcat(delta, model->getWeightAnmMtx(i), m);
+        interp::set_presentation_override(model->getWeightAnmMtx(i), m);
+    }
+}
+
+// Late latch: at draw time, move everything a hand holds from where the controller was at the
+// last sim tick to where it is for this frame. Hands then track at the headset's rate instead of
+// the game's 30 Hz.
+void latch_hands(daAlink_c* link, float step) {
+    const auto& in = xr::input();
+    cXyz feet;
+    feet.x = g_linkPrev.x + (g_linkCurr.x - g_linkPrev.x) * step;
+    feet.y = g_linkPrev.y + (g_linkCurr.y - g_linkPrev.y) * step;
+    feet.z = g_linkPrev.z + (g_linkCurr.z - g_linkPrev.z) * step;
+    const float eyeHeight = g_eyeHeightPrev + (g_eyeHeightCurr - g_eyeHeightPrev) * step;
+    const Vec3 anchor = first_person_anchor(feet, eyeHeight);
+
+    const auto latch = [&](xr::Hand hand, int handJoint, int itemJoint, int handModelJoint) {
+        const auto& state = in.hands[hand];
+        if (!g_placements[hand].valid || !state.active) {
+            return;
+        }
+        Mtx now, inv, delta;
+        build_world_matrix(now, Quat::yaw(g_yawOffset) * state.grip.orientation * item_offset(hand),
+            tracking_to_world_fp(state.grip.position, anchor));
+        MTXInverse(g_placements[hand].simTarget, inv);
+        MTXConcat(now, inv, delta);
+
+        MtxP item = link->mpLinkModel->getAnmMtx(itemJoint);
+        for (MtxP joint : {link->mpLinkModel->getAnmMtx(handJoint), item}) {
+            Mtx m;
+            MTXConcat(delta, joint, m);
+            interp::set_presentation_override(joint, m);
+        }
+        if (link->mpLinkHandModel != nullptr) {
+            MtxP handModel = link->mpLinkHandModel->getAnmMtx(handModelJoint);
+            Mtx m;
+            MTXConcat(delta, handModel, m);
+            interp::set_presentation_override(handModel, m);
+        }
+        for (J3DModel* held : {link->mSwordModel, link->mShieldModel, link->mHeldItemModel}) {
+            if (attached_to(held, item)) {
+                override_model(held, delta);
+            }
+        }
+    };
+    latch(input::sword_hand(), kSwordHandJoint, kSwordItemJoint, kSwordHandModelJoint);
+    latch(input::shield_hand(), kShieldHandJoint, kShieldItemJoint, kShieldHandModelJoint);
+}
+
+}  // namespace
+
 bool hand_aim(s16& yaw, s16& pitch) {
     if (!g_active || !getSettings().vr.motionControls) {
         return false;
     }
-    const auto& hand = xr::input().hands[input::sword_hand()];
-    if (!hand.active) {
-        return false;
+    // A drawn bow shoots along the string; otherwise point with the hand holding the item (the bow
+    // hand for the bow and slingshot).
+    Vec3 trackingDir;
+    if (!input::bow_aim(trackingDir)) {
+        const auto& hand = xr::input().hands[g_bowReady ? input::shield_hand() : input::sword_hand()];
+        if (!hand.active) {
+            return false;
+        }
+        trackingDir = hand.aim.forward();
     }
-    const Vec3 trackingDir = hand.aim.forward();
     float yawRad;
     if (g_firstPersonFrame) {
         yawRad = g_yawOffset;
@@ -559,6 +842,11 @@ void draw_imgui_window(bool* open) {
     if (ImGui::Button("Recenter")) {
         recenter();
     }
+    combo("Desktop window shows", vr.mirror, "Right eye\0HUD panel\0");
+    ImGui::SeparatorText("HUD panel");
+    sliderF("HUD distance", vr.hudDistance, 0.5f, 3.f, "%.2f m");
+    sliderF("HUD width", vr.hudWidth, 0.5f, 3.f, "%.2f m");
+    sliderF("HUD height", vr.hudHeight, -1.f, 1.f, "%.2f m");
     ImGui::SeparatorText("Movement");
     combo("Turning", vr.turnMode, "Snap\0Smooth\0Off\0");
     {
@@ -576,9 +864,12 @@ void draw_imgui_window(bool* open) {
     checkbox("Motion controls", vr.motionControls);
     checkbox("Left handed (sword in left controller)", vr.leftHanded);
     sliderF("Swing speed", vr.swingSpeed, 1.0f, 5.0f, "%.1f m/s");
-    sliderF("Hand pitch offset", vr.handOffsetPitch, -180.f, 180.f, "%.0f");
-    sliderF("Hand yaw offset", vr.handOffsetYaw, -180.f, 180.f, "%.0f");
-    sliderF("Hand roll offset", vr.handOffsetRoll, -180.f, 180.f, "%.0f");
+    sliderF("Sword pitch", vr.handOffsetPitch, -180.f, 180.f, "%.0f deg");
+    sliderF("Sword yaw", vr.handOffsetYaw, -180.f, 180.f, "%.0f deg");
+    sliderF("Sword roll", vr.handOffsetRoll, -180.f, 180.f, "%.0f deg");
+    sliderF("Shield pitch", vr.shieldOffsetPitch, -180.f, 180.f, "%.0f deg");
+    sliderF("Shield yaw", vr.shieldOffsetYaw, -180.f, 180.f, "%.0f deg");
+    sliderF("Shield roll", vr.shieldOffsetRoll, -180.f, 180.f, "%.0f deg");
     ImGui::SeparatorText("Rendering");
     sliderF("Resolution scale (restart)", vr.resolutionScale, 0.5f, 1.5f);
     if (changed) {

@@ -54,6 +54,15 @@ bool g_prevStickClick = false;
 
 xr::InputState g_lastInput;
 
+// Physical bow: the off hand holds the bow, the sword hand grabs the string near it and pulls.
+constexpr float kNockDistance = 0.22f;  // meters between the hands to grab the string
+constexpr float kFullDraw = 0.45f;      // meters of pull for a full draw
+bool g_pointerCaptured = false;
+bool g_bowDrawing = false;
+float g_bowPull = 0.f;
+float g_bowHapticTimer = 0.f;
+Vec3 g_bowDir;
+
 s8 to_stick(float v) {
     return static_cast<s8>(std::clamp(std::lround(v * 127.f), -127l, 127l));
 }
@@ -150,6 +159,41 @@ void detect_shield(const xr::HandState& hand, const Pose& head, const Context& c
     }
 }
 
+void update_bow(const xr::InputState& in, float dt, const Context& ctx) {
+    const auto& string = in.hands[sword_hand()];
+    const auto& bow = in.hands[shield_hand()];
+    const bool grip = in.squeeze[sword_hand()] > 0.6f || in.trigger[sword_hand()] > 0.6f;
+    if (!ctx.bowReady || !string.active || !bow.active) {
+        g_bowDrawing = false;
+        return;
+    }
+    const Vec3 toBow = bow.grip.position - string.grip.position;
+    const float dist = toBow.length();
+    if (!g_bowDrawing) {
+        if (grip && dist < kNockDistance) {
+            g_bowDrawing = true;
+            xr::haptic(sword_hand(), 0.4f, 0.03f);
+        }
+        return;
+    }
+    if (!grip) {
+        // Letting go of the string releases the item button, which shoots.
+        g_bowDrawing = false;
+        xr::haptic(shield_hand(), 0.8f, 0.06f);
+        return;
+    }
+    g_bowPull = std::clamp(dist / kFullDraw, 0.f, 1.f);
+    if (dist > 0.05f) {
+        g_bowDir = toBow * (1.f / dist);
+    }
+    // Rising string tension.
+    g_bowHapticTimer -= dt;
+    if (g_bowHapticTimer <= 0.f) {
+        xr::haptic(sword_hand(), 0.1f + 0.4f * g_bowPull, 0.01f);
+        g_bowHapticTimer = 0.08f - 0.05f * g_bowPull;
+    }
+}
+
 void queue_spin() {
     // Quick spin: a full stick rotation followed by B.
     g_macro.clear();
@@ -165,6 +209,16 @@ void queue_spin() {
 
 xr::Hand sword_hand() { return getSettings().vr.leftHanded ? xr::kLeft : xr::kRight; }
 xr::Hand shield_hand() { return getSettings().vr.leftHanded ? xr::kRight : xr::kLeft; }
+
+void set_pointer_captured(bool captured) { g_pointerCaptured = captured; }
+
+bool bow_aim(Vec3& dir) {
+    if (!g_bowDrawing) {
+        return false;
+    }
+    dir = g_bowDir;
+    return true;
+}
 
 FrameResult update_frame(const xr::InputState& in, const Pose& head, float dt, const Context& ctx) {
     FrameResult result;
@@ -208,11 +262,19 @@ FrameResult update_frame(const xr::InputState& in, const Pose& head, float dt, c
     g_prevStickClick = in.stickClick[s];
 
     if (ctx.gameplay && getSettings().vr.motionControls) {
-        detect_sword(in.hands[s], head, dt, ctx);
-        detect_shield(in.hands[shield_hand()], head, ctx);
+        update_bow(in, dt, ctx);
+        if (ctx.bowReady) {
+            // Pulling a bowstring is not a sword swing, and the bow arm isn't a shield.
+            g_prevTipValid = false;
+            g_shieldUp = false;
+        } else {
+            detect_sword(in.hands[s], head, dt, ctx);
+            detect_shield(in.hands[shield_hand()], head, ctx);
+        }
     } else {
         g_prevTipValid = false;
         g_shieldUp = false;
+        g_bowDrawing = false;
     }
 
     g_crouching = ctx.gameplay && getSettings().vr.physicalCrouch && ctx.standingHeight > 0.5f &&
@@ -239,7 +301,7 @@ void sync_virtual_pad(const Context& ctx) {
     }
 
     u16 buttons = 0;
-    if (in.trigger[s] > 0.6f) buttons |= PAD_BUTTON_B;
+    if (in.trigger[s] > 0.6f && !g_pointerCaptured) buttons |= PAD_BUTTON_B;
     if (in.buttonLower[s]) buttons |= PAD_BUTTON_A;
     if (in.buttonUpper[s]) buttons |= PAD_TRIGGER_Z;
     if (in.buttonLower[o]) buttons |= PAD_BUTTON_X;
@@ -252,6 +314,10 @@ void sync_virtual_pad(const Context& ctx) {
     if (in.squeeze[o] > 0.6f) {
         buttons |= PAD_TRIGGER_R;
         status.triggerRight = 200;
+    }
+
+    if (ctx.gameplay && g_bowDrawing) {
+        buttons |= ctx.bowSlot == 1 ? PAD_BUTTON_Y : PAD_BUTTON_X;
     }
 
     if (ctx.gameplay) {

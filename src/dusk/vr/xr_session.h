@@ -43,6 +43,8 @@ bool session_running();
 // xrWaitFrame + xrBeginFrame + view/action location. Returns false if no frame should be drawn.
 bool begin_frame();
 bool should_render();
+// Tracking is valid this frame (it may still be hidden, e.g. headset not worn).
+bool views_valid();
 const EyeView& eye(int index);
 const Pose& head();
 bool head_valid();
@@ -52,6 +54,12 @@ bool floor_relative();
 
 // Queues the blit of the next aurora frame's output into this eye's swapchain image.
 void render_eye(int index);
+// HUD panel: phase 0 keeps the next aurora frame (HUD over black), phase 1 composes it with the
+// next frame (HUD over white) into the panel's swapchain.
+void render_hud(int phase);
+void set_hud_pose(const Pose& pose, float widthMeters, float heightMeters);
+// Menu pointer dot, drawn as its own small quad so it moves at the headset's rate.
+void set_cursor(bool visible, const Pose& pose, float sizeMeters);
 // Waits for submission, releases images and ends the OpenXR frame.
 void end_frame();
 

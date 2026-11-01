@@ -55,6 +55,7 @@
 #include "dusk/settings.h"
 #include "helpers/endian.h"
 #include "helpers/gx_helper.h"
+#include "dusk/vr/vr.h"
 
 #include <aurora/lib/window.hpp>
 #include <SDL3/SDL_video.h>
@@ -802,8 +803,11 @@ void mDoGph_gInf_c::updateRenderSize() {
     u32 width, height;
     AuroraGetRenderSize(&width, &height);
     JUTVideo::getManager()->setRenderSize(width, height);
-    l_tvSize[1].width = static_cast<u16>(static_cast<float>(width) / static_cast<float>(height) *
-                                         static_cast<float>(l_tvSize[1].height));
+    // In VR the framebuffer has the eye's (portrait) shape, but the HUD is shown on a 16:9 panel:
+    // lay the 2D out for 16:9 and let the panel undo the stretch.
+    const float aspect = dusk::vr::active() ? 16.0f / 9.0f :
+                                              static_cast<float>(width) / static_cast<float>(height);
+    l_tvSize[1].width = static_cast<u16>(aspect * static_cast<float>(l_tvSize[1].height));
     onWide();
 }
 #endif
@@ -2193,6 +2197,17 @@ int mDoGph_Painter() {
 
     IF_NOT_DUSK(dComIfGp_particle_calcMenu());
 
+#if TARGET_PC
+    // VR draws the 3D scene once per eye and the 2D HUD separately onto a floating panel. The HUD
+    // is drawn over black and over white to recover its alpha.
+    const dusk::vr::Pass vrPass = dusk::vr::render_pass();
+    const bool vrEyePass = vrPass == dusk::vr::Pass::Eye;
+    const bool vrHudPass = vrPass == dusk::vr::Pass::HudBlack || vrPass == dusk::vr::Pass::HudWhite;
+#else
+    const bool vrEyePass = false;
+    const bool vrHudPass = false;
+#endif
+
     JFWDisplay::getManager()->setFader(mDoGph_gInf_c::getFader());
     mDoGph_gInf_c::setClearColor(mDoGph_gInf_c::getBackColor());
     mDoGph_gInf_c::beginRender();
@@ -2218,7 +2233,9 @@ int mDoGph_Painter() {
     #endif
 
     dComIfGp_setCurrentGrafPort(&ortho);
-    GX_DEBUG_GROUP(dComIfGd_drawCopy2D);
+    if (!vrHudPass) {
+        GX_DEBUG_GROUP(dComIfGd_drawCopy2D);
+    }
 
     #if DEBUG
     // "↓↓↓↓↓↓↓↓↓↓ CPU time measuring start ↓↓↓↓↓↓↓↓↓↓"
@@ -2228,7 +2245,7 @@ int mDoGph_Painter() {
     fapGm_HIO_c::stopCpuTimer("画面キャプチャー用２Ｄ描画まで（レンダリング）");
     #endif
 
-    if (dComIfGp_getWindowNum() != 0) {
+    if (dComIfGp_getWindowNum() != 0 && !vrHudPass) {
         dDlst_window_c* window_p = dComIfGp_getWindow(0);
         int camera_id = window_p->getCameraID();
         camera_process_class* camera_p = dComIfGp_getCamera(camera_id);
@@ -2673,7 +2690,10 @@ int mDoGph_Painter() {
                     dComIfGp_particle_draw2Dgame(&draw_info2);
                 }
 
-                trimming(&camera_p->view, view_port);
+                // Letterbox bars make no sense in a headset.
+                if (!vrEyePass) {
+                    trimming(&camera_p->view, view_port);
+                }
 
                 if (strcmp(dComIfGp_getStartStageName(), "F_SP127") != 0 &&
                     (mDoGph_gInf_c::isFade() & 0x80) == 0)
@@ -2694,7 +2714,8 @@ int mDoGph_Painter() {
     #endif
 
     #if TARGET_PC
-    if (dusk::getSettings().game.enableMirrorMode && dComIfGp_getWindowNum() != 0)
+    if (dusk::getSettings().game.enableMirrorMode && dComIfGp_getWindowNum() != 0 &&
+        !vrEyePass && !vrHudPass)
     #elif PLATFORM_WII
     if (data_8053a730)
     #endif
@@ -2759,7 +2780,13 @@ int mDoGph_Painter() {
     dusk::mods::gfx_run_stage(GFX_STAGE_FRAME_BEFORE_HUD);
 #endif
 
-    if (fapGmHIO_get2Ddraw()) {
+    if (vrEyePass) {
+        // The HUD goes on the VR panel, but a fade over the HUD still has to darken the eyes.
+        if (strcmp(dComIfGp_getStartStageName(), "F_SP127") == 0 || (mDoGph_gInf_c::isFade() & 0x80) != 0)
+        {
+            mDoGph_gInf_c::calcFade();
+        }
+    } else if (fapGmHIO_get2Ddraw()) {
         Mtx m4;
         cMtx_copy(j3dSys.getViewMtx(), m4);
 
@@ -2837,6 +2864,16 @@ int mDoGph_Painter() {
 #endif
 
     mDoGph_gInf_c::endRender();
+
+#if TARGET_PC
+    // Aurora clears each frame with the last copy-clear color it saw, so this picks the background
+    // of the next frame: the HUD passes need plain black and plain white.
+    if (u8 level; dusk::vr::next_frame_clear(level)) {
+        GXSetCopyClear(JUtility::TColor(level, level, level, 255), GX_MAX_Z24);
+    } else if (vrHudPass) {
+        GXSetCopyClear(mDoGph_gInf_c::getBackColor(), GX_MAX_Z24);
+    }
+#endif
 
     #if WIDESCREEN_SUPPORT
     mDoGph_gInf_c::offWideZoom();

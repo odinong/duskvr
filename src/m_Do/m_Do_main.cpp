@@ -244,6 +244,19 @@ static void run_vr_frame() {
         dusk::interp::end_presentation();
         aurora_end_frame();
     }
+    if (eyes > 0 && dusk::vr::hud_pending()) {
+        for (int phase = 0; phase < 2; ++phase) {
+            if (!aurora_begin_frame()) {
+                break;
+            }
+            dusk::vr::begin_hud(phase);
+            dusk::interp::begin_presentation(step);
+            fpcM_DrawIterater((fpcM_DrawIteraterFunc)fpcM_Draw);
+            cAPIGph_Painter();
+            dusk::interp::end_presentation();
+            aurora_end_frame();
+        }
+    }
     dusk::vr::end_frame();
 }
 

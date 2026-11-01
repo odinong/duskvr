@@ -366,9 +366,16 @@ struct UserSettings {
         ConfigVar<bool> roomScale;
         ConfigVar<bool> levelHorizon;     // third person / cutscenes: drop camera pitch and roll
         ConfigVar<float> resolutionScale;
-        ConfigVar<float> handOffsetPitch; // degrees, controller grip -> Link's hand bone
+        ConfigVar<float> handOffsetPitch; // degrees, extra rotation of the sword in the hand
         ConfigVar<float> handOffsetYaw;
         ConfigVar<float> handOffsetRoll;
+        ConfigVar<float> shieldOffsetPitch; // degrees, extra rotation of the shield
+        ConfigVar<float> shieldOffsetYaw;
+        ConfigVar<float> shieldOffsetRoll;
+        ConfigVar<float> hudDistance;     // meters
+        ConfigVar<float> hudWidth;        // meters
+        ConfigVar<float> hudHeight;       // meters, relative to the eyes
+        ConfigVar<int> mirror;            // desktop window: 0 = right eye, 1 = HUD panel
     } vr;
 
     // Arrays of size 4 for 4 ports

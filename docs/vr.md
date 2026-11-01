@@ -1,7 +1,8 @@
 # Dusklight VR
 
 Full 6DoF OpenXR support, built into the engine: the game renders each eye itself, first person at
-Link's eyes with a third-person toggle, and motion controls for the sword, shield and aiming.
+Link's eyes with a third-person toggle, the HUD and menus on a floating panel you point at, and
+motion controls for the sword, shield, bow and aiming.
 
 ## Requirements
 
@@ -38,7 +39,9 @@ The sword hand is the right controller by default (Settings: left handed).
 | Raise the off hand in front of your chest | Lock on and guard with the shield (L) |
 | Punch forward with the shield while locked on | Shield bash |
 | Crouch for real | Crouch (R) |
-| Point the sword-hand controller while aiming | Aim bow, slingshot, clawshot, boomerang... |
+| Bow / slingshot out: grab the string near the bow with the sword hand (grip or trigger), pull back, let go | Draw and shoot; the arrow flies from the string through the bow |
+| Point the sword-hand controller while aiming | Aim clawshot, boomerang, other aimed items |
+| In menus: point at the panel, pull the sword-hand trigger | Click (laser pointer) |
 | Sword-hand trigger | B (sword, cancel) |
 | Sword-hand A / B | A (action) / Z (Midna) |
 | Off-hand X / Y | X / Y items |
@@ -47,18 +50,32 @@ The sword hand is the right controller by default (Settings: left handed).
 
 Room scale is on by default: walking in your room moves Link, and walls stop you.
 
+The controllers vibrate when the sword connects, when you get hurt, while drawing the bow (rising
+tension) and when you raise the shield.
+
 ## Settings
 
 Tools > VR in the Dusklight menu bar (desktop window) has every option: perspective, world scale
-(game units per meter, 100 by default), height offset, turning, hand-oriented movement, room scale,
-physical crouch, motion controls, swing speed, resolution scale and recenter.
+(game units per meter, 100 by default), height offset, HUD panel distance / width / height,
+turning, hand-oriented movement, room scale, physical crouch, motion controls, swing speed,
+sword and shield angle offsets, what the desktop window mirrors, resolution scale and recenter.
+Any of them can also be set for one run with `--cvar`, e.g. `--cvar vr.mirror=1`.
 
-### Hand calibration
+### Hands
 
-In first person Link's body and head are hidden and his hands (with the sword and shield) follow
-your controllers. Link's hand bones are not oriented like a controller grip, so the sword may point
-the wrong way until calibrated: adjust the hand pitch / yaw / roll offsets in Tools > VR while
-holding the controller like a sword, until the blade lines up with the controller.
+In first person Link's body and head are hidden; his hands, and whatever they hold, follow your
+controllers. The controller holds the item joint the game attaches weapons to, oriented so the
+blade points along the controller like a held sword. Everything held is moved to the controller's
+pose again at draw time, so hands track at the headset's refresh rate rather than the game's 30 Hz.
+If a weapon sits at an odd angle in your grip, the sword / shield pitch, yaw and roll offsets in
+Tools > VR adjust it.
+
+### HUD panel
+
+Hearts, buttons, map, text boxes and menus are drawn on a 16:9 panel 1.5 m in front of you. It
+turns lazily to follow your gaze once you look more than 35 degrees away and holds still while the
+game is paused. In menus the sword-hand controller becomes a laser pointer with a dot on the panel;
+the trigger clicks.
 
 ## How it works
 
@@ -74,16 +91,22 @@ holding the controller like a sword, until the blade lines up with the controlle
 - Each headset frame simulates once, then runs the frame-interpolation presentation once per eye;
   the eye camera replaces the interpolated game camera inside that presentation. Frame
   interpolation is forced on while VR is active.
+- The painter (`mDoGph_Painter`) skips the 2D in eye passes. After each simulation tick two more
+  frames draw only the 2D, over black and over white; the HUD's alpha is recovered from the
+  difference (`1 - (white - black)`) and the result goes to an OpenXR quad layer.
+- Held items are late-latched through `dusk::interp::set_presentation_override`: at draw time each
+  matrix of the hand, sword, shield or held item is moved from the controller pose of the last sim
+  tick to the current one.
 - Aurora hooks (`patches/aurora-vr.patch`): a per-eye framebuffer size override, a per-frame hook
   that sees the finished frame before the window present, skipping the window present, and the
   D3D12 shared-texture device features.
 
 ## Known limitations
 
-- The HUD and menus are drawn into each eye at a fixed spot in your view (no floating panel yet).
 - Cutscenes and scripted events use the game camera with head tracking on top.
-- The hands follow the controllers at the 30 Hz simulation rate (interpolated), so they lag
-  slightly behind the controllers.
-- Sword hits follow the attack animation's timing; a swing triggers the attack but the blade's
-  hitbox only exists while that animation runs.
+- Sword hits follow the attack animation's timing: a swing triggers the attack, and the blade's
+  hitbox (which follows your controller) is live while that attack runs.
+- 2D markers that point at things in the world (lock-on arrows) sit on the HUD panel where the flat
+  game would draw them, not over the target.
 - Wolf Link in first person has no visible paws.
+- Only tested on SteamVR with a Valve Index; other runtimes should work through OpenXR.
