@@ -19031,6 +19031,11 @@ void daAlink_c::setDrawHand() {
         }
     }
 
+#if TARGET_PC
+    // VR: the player's fingers pick the hand shapes.
+    dusk::vr::override_hand_shapes(this, var_r30, var_r29);
+#endif
+
     mpLinkHandModel->setBaseTRMtx(mpLinkModel->getBaseTRMtx());
     mpLinkHandModel->calc();
 

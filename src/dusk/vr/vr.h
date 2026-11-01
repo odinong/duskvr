@@ -62,6 +62,8 @@ bool first_person();
 bool hide_link_body();
 bool hide_link_head();
 void override_link_hands(daAlink_c* link);
+// Picks Link's hand shapes (indices into his hand model: left 0-4, right 5-10).
+void override_hand_shapes(daAlink_c* link, u8& left, u8& right);
 bool hand_aim(s16& yaw, s16& pitch);
 
 // Debug/settings UI.
@@ -90,6 +92,7 @@ inline bool first_person() { return false; }
 inline bool hide_link_body() { return false; }
 inline bool hide_link_head() { return false; }
 inline void override_link_hands(daAlink_c*) {}
+inline void override_hand_shapes(daAlink_c*, u8&, u8&) {}
 inline bool hand_aim(s16&, s16&) { return false; }
 inline void draw_imgui_window(bool*) {}
 inline void recenter() {}

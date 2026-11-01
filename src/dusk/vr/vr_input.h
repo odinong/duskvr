@@ -22,6 +22,7 @@ struct Context {
     bool climbing = false;     // ladder, vines, ledge or ceiling
     bool swimming = false;
     bool riding = false;       // on Epona
+    bool carrying = false;     // holding a pot, bomb, rock... over his head
 };
 
 // Runs every headset frame: turning, view toggles and gesture detection. Gestures are latched until

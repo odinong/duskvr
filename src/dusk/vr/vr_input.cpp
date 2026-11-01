@@ -37,6 +37,7 @@ struct Latched {
     bool bash = false;
     bool dig = false;   // wolf: A
     bool spur = false;  // horse: A
+    bool toss = false;  // carrying: A throws
 };
 
 Latched g_latched;
@@ -62,6 +63,7 @@ bool g_prevHeadValid = false;
 float g_lungeCooldown = 0.f;
 float g_digCooldown = 0.f;
 float g_spurCooldown = 0.f;
+float g_tossCooldown = 0.f;
 bool g_climbActive = false;
 float g_climbX = 0.f, g_climbY = 0.f;
 float g_swimDrive = 0.f;
@@ -312,6 +314,23 @@ void detect_reins(const xr::InputState& in, float dt) {
     }
 }
 
+// Carrying something: throw it with a quick forward toss of either hand.
+void detect_toss(const Pose& head, float dt) {
+    g_tossCooldown = std::max(0.f, g_tossCooldown - dt);
+    if (g_tossCooldown > 0.f) {
+        return;
+    }
+    for (int h = 0; h < 2; ++h) {
+        const Vec3 v = to_head_frame(g_handVelocity[h], head);
+        if (-v.z > 1.6f) {
+            g_latched.toss = true;
+            g_tossCooldown = 0.6f;
+            xr::haptic(static_cast<xr::Hand>(h), 0.6f, 0.05f);
+            return;
+        }
+    }
+}
+
 void queue_spin() {
     // Quick spin: a full stick rotation followed by B.
     g_macro.clear();
@@ -395,10 +414,13 @@ FrameResult update_frame(const xr::InputState& in, const Pose& head, float dt, c
         if (ctx.riding) {
             detect_reins(in, dt);
         }
+        if (ctx.carrying) {
+            detect_toss(head, dt);
+        }
         if (ctx.wolf) {
             detect_wolf(in, head, dt, ctx);
             g_shieldUp = false;
-        } else if (ctx.climbing || ctx.swimming) {
+        } else if (ctx.climbing || ctx.swimming || ctx.carrying) {
             // Hands are busy climbing or swimming.
             g_prevTipValid = false;
             g_shieldUp = false;
@@ -478,7 +500,7 @@ void sync_virtual_pad(const Context& ctx) {
         if (ctx.swimming && g_swimDrive > 0.05f && stickIdle) {
             status.stickY = to_stick(g_swimDrive);
         }
-        if (g_latched.dig || g_latched.spur) {
+        if (g_latched.dig || g_latched.spur || g_latched.toss) {
             buttons |= PAD_BUTTON_A;
         }
     }

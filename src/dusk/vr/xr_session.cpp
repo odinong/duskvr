@@ -129,6 +129,13 @@ std::array<XrSpace, 2> g_gripSpaces{};
 std::array<XrSpace, 2> g_aimSpaces{};
 InputState g_input;
 
+// XR_EXT_hand_tracking: finger joints, when the runtime has them.
+bool g_handTrackingExt = false;
+std::array<XrHandTrackerEXT, 2> g_handTrackers{};
+PFN_xrCreateHandTrackerEXT g_createHandTracker = nullptr;
+PFN_xrDestroyHandTrackerEXT g_destroyHandTracker = nullptr;
+PFN_xrLocateHandJointsEXT g_locateHandJoints = nullptr;
+
 // Blit pipelines, created on the render worker.
 enum class BlitKind { Copy, HudCompose, Cursor, Eye, Crop };
 struct BlitPipeline {
@@ -801,6 +808,85 @@ void copy_to_swapchains() {
     g_d3dQueue->Signal(g_copyFence.Get(), ctx.fenceValue);
 }
 
+// Total bend along a finger's joints, as a 0..1 curl.
+float finger_curl(const XrHandJointLocationEXT* joints, std::initializer_list<int> chain, float fullBend) {
+    float total = 0.f;
+    Vec3 prev;
+    bool havePrev = false;
+    const int* ids = chain.begin();
+    for (size_t i = 0; i + 1 < chain.size(); ++i) {
+        const auto& a = joints[ids[i]].pose.position;
+        const auto& b = joints[ids[i + 1]].pose.position;
+        const Vec3 dir = Vec3{b.x - a.x, b.y - a.y, b.z - a.z}.normalized();
+        if (havePrev) {
+            total += std::acos(std::clamp(prev.dot(dir), -1.f, 1.f));
+        }
+        prev = dir;
+        havePrev = true;
+    }
+    return std::clamp(total / fullBend, 0.f, 1.f);
+}
+
+void read_fingers(InputState& in, XrTime time) {
+    for (int h = 0; h < 2; ++h) {
+        // Without hand tracking: the trigger is the index finger, the grip the other three.
+        in.curl[h][0] = in.buttonLower[h] || in.buttonUpper[h] || in.stickClick[h] ? 1.f : 0.f;
+        in.curl[h][1] = in.trigger[h];
+        in.curl[h][2] = in.curl[h][3] = in.curl[h][4] = in.squeeze[h];
+        in.fingersTracked[h] = false;
+        if (g_handTrackers[h] == XR_NULL_HANDLE) {
+            continue;
+        }
+        std::array<XrHandJointLocationEXT, XR_HAND_JOINT_COUNT_EXT> joints{};
+        XrHandJointLocationsEXT locations{XR_TYPE_HAND_JOINT_LOCATIONS_EXT};
+        locations.jointCount = XR_HAND_JOINT_COUNT_EXT;
+        locations.jointLocations = joints.data();
+        XrHandJointsLocateInfoEXT info{XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT};
+        info.baseSpace = g_appSpace;
+        info.time = time;
+        if (XR_FAILED(g_locateHandJoints(g_handTrackers[h], &info, &locations)) || !locations.isActive) {
+            continue;
+        }
+        in.curl[h][0] = finger_curl(joints.data(), {2, 3, 4, 5}, deg2rad(110.f));
+        in.curl[h][1] = finger_curl(joints.data(), {6, 7, 8, 9, 10}, deg2rad(230.f));
+        in.curl[h][2] = finger_curl(joints.data(), {11, 12, 13, 14, 15}, deg2rad(230.f));
+        in.curl[h][3] = finger_curl(joints.data(), {16, 17, 18, 19, 20}, deg2rad(230.f));
+        in.curl[h][4] = finger_curl(joints.data(), {21, 22, 23, 24, 25}, deg2rad(230.f));
+        in.fingersTracked[h] = true;
+    }
+}
+
+void create_hand_trackers() {
+    if (!g_handTrackingExt) {
+        return;
+    }
+    XrSystemHandTrackingPropertiesEXT handProps{XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT};
+    XrSystemProperties props{XR_TYPE_SYSTEM_PROPERTIES, &handProps};
+    if (XR_FAILED(xrGetSystemProperties(g_instance, g_system, &props)) ||
+        !handProps.supportsHandTracking)
+    {
+        return;
+    }
+    xrGetInstanceProcAddr(g_instance, "xrCreateHandTrackerEXT",
+        reinterpret_cast<PFN_xrVoidFunction*>(&g_createHandTracker));
+    xrGetInstanceProcAddr(g_instance, "xrDestroyHandTrackerEXT",
+        reinterpret_cast<PFN_xrVoidFunction*>(&g_destroyHandTracker));
+    xrGetInstanceProcAddr(g_instance, "xrLocateHandJointsEXT",
+        reinterpret_cast<PFN_xrVoidFunction*>(&g_locateHandJoints));
+    if (!g_createHandTracker || !g_destroyHandTracker || !g_locateHandJoints) {
+        return;
+    }
+    for (int h = 0; h < 2; ++h) {
+        XrHandTrackerCreateInfoEXT info{XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT};
+        info.hand = h == kLeft ? XR_HAND_LEFT_EXT : XR_HAND_RIGHT_EXT;
+        info.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+        if (XR_FAILED(g_createHandTracker(g_session, &info, &g_handTrackers[h]))) {
+            g_handTrackers[h] = XR_NULL_HANDLE;
+        }
+    }
+    Log.info("Finger tracking available");
+}
+
 void read_input() {
     const XrActiveActionSet active{g_actionSet, XR_NULL_PATH};
     XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO};
@@ -878,11 +964,18 @@ void read_input() {
             hand.aim = hand.grip;
         }
     }
+    read_fingers(in, g_frameState.predictedDisplayTime);
     g_input = in;
 }
 
 void destroy_session() {
     aurora::xr::synchronize();
+    for (auto& tracker : g_handTrackers) {
+        if (tracker != XR_NULL_HANDLE && g_destroyHandTracker) {
+            g_destroyHandTracker(tracker);
+        }
+        tracker = XR_NULL_HANDLE;
+    }
     const auto destroy = [](Swapchain& sc) {
         sc.stagingTexture = {};
         sc.stagingMemory = {};
@@ -988,6 +1081,7 @@ bool create_session() {
     if (!create_action_spaces()) {
         return false;
     }
+    create_hand_trackers();
     aurora::xr::synchronize();
     return create_swapchains();
 }
@@ -1010,14 +1104,20 @@ bool initialize() {
         return false;
     }
 
-    const char* enabled[] = {XR_KHR_D3D12_ENABLE_EXTENSION_NAME};
+    std::vector<const char*> enabled{XR_KHR_D3D12_ENABLE_EXTENSION_NAME};
+    g_handTrackingExt = std::ranges::any_of(exts, [](const XrExtensionProperties& e) {
+        return std::strcmp(e.extensionName, XR_EXT_HAND_TRACKING_EXTENSION_NAME) == 0;
+    });
+    if (g_handTrackingExt) {
+        enabled.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
+    }
     XrInstanceCreateInfo info{XR_TYPE_INSTANCE_CREATE_INFO};
     std::strcpy(info.applicationInfo.applicationName, "Dusklight VR");
     info.applicationInfo.applicationVersion = 1;
     std::strcpy(info.applicationInfo.engineName, "Aurora");
     info.applicationInfo.apiVersion = XR_API_VERSION_1_0;
-    info.enabledExtensionCount = 1;
-    info.enabledExtensionNames = enabled;
+    info.enabledExtensionCount = static_cast<uint32_t>(enabled.size());
+    info.enabledExtensionNames = enabled.data();
     XR_TRY(xrCreateInstance(&info, &g_instance));
 
     XrInstanceProperties props{XR_TYPE_INSTANCE_PROPERTIES};

@@ -31,6 +31,10 @@ struct InputState {
     bool buttonLower[2]{};  // A (right) / X (left)
     bool buttonUpper[2]{};  // B (right) / Y (left)
     bool menu = false;
+    // Finger curl, 0 = straight, 1 = fully curled: thumb, index, middle, ring, little. From hand
+    // tracking when the runtime offers it (Index controllers do), otherwise from trigger and grip.
+    float curl[2][5]{};
+    bool fingersTracked[2]{};
 };
 
 bool initialize();

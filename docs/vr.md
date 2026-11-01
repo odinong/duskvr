@@ -54,6 +54,8 @@ The sword hand is the right controller by default (Settings: left handed).
 | Ladder, vines, ledge, ceiling: hold grip and pull | Climb (pull down to go up, sideways to shuffle) |
 | Swimming: sweep both arms back | Swim forward |
 | On Epona: flick both hands down | Spur (A) |
+| Carrying a pot, rock or bomb: toss it forward | Throw (A) |
+| Curl your fingers (Index finger tracking, or trigger/grip) | Link's hand opens, hooks, makes a fist or pinches |
 
 Room scale is on by default: walking in your room moves Link, and walls stop you. Standing still,
 Link's body turns to face where you look once you look far enough away, pivoting around his eyes so
@@ -68,10 +70,26 @@ Tools > VR in the Dusklight menu bar (desktop window) has every option: perspect
 (game units per meter, 100 by default), height offset, HUD panel distance / width / height,
 turning, hand-oriented movement, room scale, physical crouch, motion controls, swing speed,
 sword and shield angle offsets, what the desktop window mirrors, resolution scale and recenter.
-Any of them can also be set for one run with `--cvar`, e.g. `--cvar vr.mirror=1`.
+Any of them can also be set for one run with `--cvar`, e.g. `--cvar vr.desktopView=2`.
 
 The comfort vignette (off by default) darkens the edges of your view while the stick, smooth
 turning, climbing, swimming or riding moves you.
+
+### Desktop window and streaming
+
+The desktop window is a proper 16:9 picture, chosen in Tools > VR ("Desktop window shows"):
+
+- **Headset view** (default): what your right eye sees, as a 16:9 band. Free: nothing is drawn twice.
+- **Smooth first person**: a separate 16:9 camera at your eyes that follows your head's full rotation
+  with adjustable smoothing (0 = exact), optionally keeping the horizon level.
+- **Third person**: the game's own follow camera (it avoids walls), showing your whole posed body,
+  head included, the way LIV shows an avatar.
+- **Selfie camera**: in front of you, looking back at Link.
+- **Raw right eye** and **HUD panel**, for debugging.
+
+The separate cameras can include the HUD, have their own field of view, and are drawn every Nth
+headset frame (2 by default). On an RTX-class GPU with the Index at 144 Hz they cost a few frames
+per second.
 
 ### Body
 
@@ -80,6 +98,11 @@ shadow moves with you. Only the head and neck are left out of your own view. Eac
 the arm on its side through two-bone IK (elbows hang down and out like a relaxed arm), the skin at
 the elbows and shoulders follows, and the legs keep the game's walking and running animations.
 Turn the body off ("Full body" in Tools > VR) for floating hands only.
+
+Your head drives Link's: the head takes the headset's position and orientation, and the spine and
+neck bend and twist to reach it, so leaning or looking around moves his chest and shoulders (and
+the arms reaching from them). His feet stay planted while you lean or look around within 30 cm;
+step further and he takes a step to stay under you.
 
 Two toggles keep the body from fighting you (both on by default):
 
@@ -100,7 +123,11 @@ on your back, when she rides).
 
 ### Hands
 
-His hands, and whatever they hold, follow your controllers. The controller holds the item joint the game attaches weapons to, oriented so the
+His hands, and whatever they hold, follow your controllers. Link's model has no finger bones; it
+has a set of hand shapes, and an empty hand picks one from your fingers: open, a climbing hook, a
+fist, or a thumb-and-index pinch. With Index controllers the curl of each finger comes from
+SteamVR's finger tracking; on other controllers the trigger is the index finger and the grip the
+rest. A hand holding the sword or an item makes a fist; the shield hand grips the shield. The controller holds the item joint the game attaches weapons to, oriented so the
 blade points along the controller like a held sword. Everything held is moved to the controller's
 pose again at draw time, so hands track at the headset's refresh rate rather than the game's 30 Hz.
 If a weapon sits at an odd angle in your grip, the sword / shield pitch, yaw and roll offsets in
@@ -112,6 +139,24 @@ Hearts, buttons, map, text boxes and menus are drawn on a 16:9 panel 1.5 m in fr
 turns lazily to follow your gaze once you look more than 35 degrees away and holds still while the
 game is paused. In menus the sword-hand controller becomes a laser pointer with a dot on the panel;
 the trigger clicks.
+
+### Items
+
+Every item attaches through the game's own "left item" and "right item" hand joints, which follow
+your controllers, so held items sit in your hands:
+
+| Item | In VR |
+| --- | --- |
+| Sword | In your sword hand; swing, thrust, spin |
+| Shield | In your off hand; raise to guard, punch to bash |
+| Bow, slingshot | In your off hand; pull the string with the sword hand |
+| Clawshot (single and double), Gale Boomerang, Dominion Rod | Aim by pointing; fire with the item button |
+| Lantern | In your sword hand while in use, on the belt otherwise |
+| Bottles, bombs | Held in hand; carried bombs and pots are thrown with a toss |
+| Ball and Chain | Handle in your right hand, chain in both |
+| Hawkeye | Worn on the head and hidden from your own view; the zoom is not applied in the headset |
+| Iron Boots, Spinner, fishing rod | Work with their buttons as usual |
+| Epona's reins | Follow your hands; flick both hands to spur |
 
 ## How it works
 
@@ -147,4 +192,6 @@ the trigger clicks.
 - The arms don't twist the forearm to follow wrist roll; extreme wrist angles can look stiff.
 - Wolf Link, climbing, swimming and riding gestures were written against the game's code but not yet
   playtested.
+- The Hawkeye's zoom isn't applied in the headset (changing your field of view in VR is
+  uncomfortable); its scope overlay shows on the HUD panel.
 - Only tested on SteamVR with a Valve Index; other runtimes should work through OpenXR.

@@ -126,6 +126,7 @@ bool g_wolf = false;
 bool g_climbing = false;
 bool g_swimming = false;
 bool g_riding = false;
+bool g_carrying = false;
 bool g_bodyTurning = false;
 bool g_stepping = false;
 
@@ -500,6 +501,7 @@ bool begin_frame() {
     g_ctx.climbing = g_climbing;
     g_ctx.swimming = g_swimming;
     g_ctx.riding = g_riding;
+    g_ctx.carrying = g_carrying;
     g_ctx.standingHeight = g_standingHeight;
 
     if (g_needsRecenter && g_linkValid) {
@@ -711,6 +713,7 @@ void after_sim_tick() {
     g_bowSlot = link->mSelectItemId;
     g_wolf = link->checkWolf();
     g_riding = link->checkHorseRide();
+    g_carrying = !g_wolf && link->checkGrabAnime();
     switch (link->mProcID) {
     case daAlink_c::PROC_LADDER_UP_START:
     case daAlink_c::PROC_LADDER_UP_END:
@@ -1381,8 +1384,10 @@ void override_link_hands(daAlink_c* link) {
         return;
     }
 
-    // The sword goes in the player's sword hand, on that side of Link's body.
-    const bool swordRight = !getSettings().vr.leftHanded;
+    // The sword goes in the player's sword hand, on that side of Link's body. The bow and slingshot
+    // stay in the off hand (Link's own left), so the sword hand draws the string.
+    const bool swordRight =
+        !getSettings().vr.leftHanded && !link->checkBowAndSlingItem(link->mEquipItem);
     link->mLeftItemJntNo = swordRight ? kRightArm.weapon : kLeftArm.weapon;
     link->mRightItemJntNo = swordRight ? kLeftArm.weapon : kRightArm.weapon;
     g_itemsSwapped = swordRight;
@@ -1510,6 +1515,10 @@ void hide_head(daAlink_c* link) {
         collapse_model(link->mpLinkHatModel);
         collapse_model(link->mpDemoFCBlendModel);
         collapse_model(link->mpDemoFCTongueModel);
+        // The Hawkeye sits on the head; in your own view it would cover your eyes.
+        if (attached_to(link->mHeldItemModel, model->getAnmMtx(kHeadJoint))) {
+            collapse_model(link->mHeldItemModel);
+        }
     }
     // Collapse the neck too (the head's parent), or you look down into the collar.
     J3DModelData* data = model->getModelData();
@@ -1529,6 +1538,58 @@ void hide_head(daAlink_c* link) {
 }
 
 }  // namespace
+
+void override_hand_shapes(daAlink_c* link, u8& left, u8& right) {
+    // Debug aid: DUSK_VR_HAND_CYCLE=1 steps both hands through every shape every two seconds.
+    if (std::getenv("DUSK_VR_HAND_CYCLE") != nullptr) {
+        static u32 ticks = 0;
+        const u32 step = ticks++ / 60;
+        left = static_cast<u8>(step % 5);
+        right = static_cast<u8>(5 + step % 6);
+        if (ticks % 60 == 1) {
+            Log.info("hand cycle: left {} right {}", left, right);
+        }
+        return;
+    }
+    if (!first_person() || !getSettings().vr.motionControls || link->checkWolf()) {
+        return;
+    }
+    // Link's hand model has a few shapes per hand (from how his animations use them):
+    //   B fist, C weapon/shield grip, E small-object pinch, F climbing hook, G relaxed.
+    struct Shapes {
+        u8 fist, grip, pinch, hook, relaxed;
+    };
+    constexpr Shapes kLeftShapes{0, 1, 2, 3, 4};
+    constexpr Shapes kRightShapes{5, 6, 8, 9, 10};
+    const auto& in = xr::input();
+    const auto pick = [&](xr::Hand hand, const Shapes& shapes, u8 current) -> u8 {
+        if (!in.hands[hand].active) {
+            return current;
+        }
+        MtxP weapon = link->mpLinkModel->getAnmMtx(arm_for(hand).weapon);
+        if (attached_to(link->mShieldModel, weapon)) {
+            return shapes.grip;
+        }
+        if (attached_to(link->mSwordModel, weapon) || attached_to(link->mHeldItemModel, weapon)) {
+            return shapes.fist;
+        }
+        // An empty hand follows your fingers.
+        const float* c = in.curl[hand];
+        const float others = (c[2] + c[3] + c[4]) / 3.f;
+        if (others > 0.65f && c[1] > 0.6f) {
+            return shapes.fist;
+        }
+        if (c[1] > 0.55f && c[0] > 0.45f && others < 0.4f) {
+            return shapes.pinch;
+        }
+        if (others > 0.3f || c[1] > 0.4f) {
+            return shapes.hook;
+        }
+        return shapes.relaxed;
+    };
+    left = pick(xr::kLeft, kLeftShapes, left);
+    right = pick(xr::kRight, kRightShapes, right);
+}
 
 bool hand_aim(s16& yaw, s16& pitch) {
     if (!g_active || !getSettings().vr.motionControls) {
