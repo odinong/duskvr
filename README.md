@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="res/duskvr-logo.png" alt="DuskVR" width="640">
+  <img src="res/duskvr-logo.png" alt="DuskVR" width="560">
 
   <p><b>Step inside Hyrule.</b> A full-body, 6DoF virtual reality mode for
   <a href="https://github.com/TwilitRealm/dusklight">Dusklight</a>, built into the engine.</p>
