@@ -592,8 +592,10 @@ bool create_actions() {
             {g_stickClick, "/user/hand/right/input/thumbstick/click"},
             {g_trigger, "/user/hand/left/input/trigger/value"},
             {g_trigger, "/user/hand/right/input/trigger/value"},
-            {g_squeeze, "/user/hand/left/input/squeeze/value"},
-            {g_squeeze, "/user/hand/right/input/squeeze/value"},
+            // Index grips: "value" reads near 1 just from holding the controller; "force" only
+            // when you actually squeeze.
+            {g_squeeze, "/user/hand/left/input/squeeze/force"},
+            {g_squeeze, "/user/hand/right/input/squeeze/force"},
             {g_buttonLower, "/user/hand/left/input/a/click"},
             {g_buttonLower, "/user/hand/right/input/a/click"},
             {g_buttonUpper, "/user/hand/left/input/b/click"},

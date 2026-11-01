@@ -478,10 +478,15 @@ void update_gamepad(const input::FrameResult& result) {
     st.leftTrigger = in.trigger[o];
     st.rightTrigger = in.squeeze[o];
     st.south = in.buttonLower[s];
-    st.east = in.trigger[s] > 0.6f && !triggerBusy;
     st.west = in.buttonLower[o];
     st.north = in.buttonUpper[o];
-    st.rightShoulder = in.buttonUpper[s];
+    if (menus) {
+        // In Dusklight's menus the trigger only clicks the laser; B goes back.
+        st.east = in.buttonUpper[s];
+    } else {
+        st.east = in.trigger[s] > 0.6f && !triggerBusy;
+        st.rightShoulder = in.buttonUpper[s];
+    }
     st.leftShoulder = in.squeeze[s] > 0.6f;
     st.leftStick = in.stickClick[o];
     st.rightStick = in.stickClick[s];

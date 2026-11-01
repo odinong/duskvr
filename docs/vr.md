@@ -72,7 +72,8 @@ tension) and when you raise the shield.
 
 ## Settings
 
-Tools > VR in the Dusklight menu bar (desktop window) has every option: perspective, world scale
+Every option is in Dusklight's Settings under the **VR** tab (open the Dusklight menu by holding
+Menu in the headset). The desktop debug window Tools > VR has them too: perspective, world scale
 (game units per meter, 100 by default), height offset, HUD panel distance / width / height,
 turning, hand-oriented movement, room scale, physical crouch, motion controls, swing speed,
 sword and shield angle offsets, what the desktop window mirrors, resolution scale and recenter.

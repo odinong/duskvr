@@ -24,6 +24,7 @@
 #include "dusk/livesplit.h"
 #include "dusk/presentation.hpp"
 #include "dusk/speedrun.h"
+#include "dusk/vr/vr.h"
 
 #include <aurora/gfx.h>
 #include <aurora/lib/window.hpp>
@@ -459,6 +460,61 @@ SelectButton& config_int_select(Pane& leftPane, Pane& rightPane, ConfigVar<int>&
         pane.add_text(helpText);
     });
     return button;
+}
+
+// A float setting shown as a whole number of `unit`s (e.g. degrees, centimetres).
+SelectButton& config_float_select(Pane& leftPane, Pane& rightPane, ConfigVar<float>& var,
+    Rml::String key, Rml::String helpText, int min, int max, int step, float unit,
+    std::string suffix = "") {
+    auto& button = leftPane.add_child<NumberButton>(NumberButton::Props{
+        .key = std::move(key),
+        .getValue = [&var, unit] { return static_cast<int>(std::lround(var.getValue() / unit)); },
+        .setValue =
+            [&var, min, max, unit](int value) {
+                var.setValue(static_cast<float>(std::clamp(value, min, max)) * unit);
+                config::save();
+            },
+        .isModified = [&var] { return var.getValue() != var.getDefaultValue(); },
+        .min = min,
+        .max = max,
+        .step = step,
+        .suffix = suffix,
+    });
+    leftPane.register_control(button, rightPane, [helpText = std::move(helpText)](Pane& pane) {
+        pane.clear();
+        pane.add_rml(helpText);
+    });
+    return button;
+}
+
+// An int setting picked from a list of named choices.
+void config_choice_select(Pane& leftPane, Pane& rightPane, ConfigVar<int>& var, Rml::String key,
+    Rml::String helpText, std::vector<Rml::String> choices) {
+    leftPane.register_control(
+        leftPane.add_select_button({
+            .key = std::move(key),
+            .getValue =
+                [&var, choices] {
+                    const int i = var.getValue();
+                    return i >= 0 && i < static_cast<int>(choices.size()) ? choices[i] : Rml::String{};
+                },
+            .isModified = [&var] { return var.getValue() != var.getDefaultValue(); },
+        }),
+        rightPane, [&var, choices, helpText = std::move(helpText)](Pane& pane) {
+            pane.clear();
+            for (int i = 0; i < static_cast<int>(choices.size()); ++i) {
+                pane.add_button({
+                                    .text = choices[i],
+                                    .isSelected = [&var, i] { return var.getValue() == i; },
+                                })
+                    .on_pressed([&var, i] {
+                        mDoAud_seStartMenu(kSoundItemChange);
+                        var.setValue(i);
+                        config::save();
+                    });
+            }
+            pane.add_rml(helpText);
+        });
 }
 
 void graphics_tuner_control(Window& window, Pane& leftPane, Pane& rightPane,
@@ -1670,6 +1726,155 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
         add_speedrun_disabled_option(leftPane, rightPane, getSettings().game.recordingMode,
             "Recording Mode",
             "Disables the game HUD and all background music.<br/><br/>Useful for recording footage.");
+    });
+
+    add_tab("VR", [this](Rml::Element* content) {
+        auto& leftPane = add_child<Pane>(content, Pane::Type::Controlled);
+        auto& rightPane = add_child<Pane>(content, Pane::Type::Uncontrolled);
+        auto& vr = getSettings().vr;
+
+        leftPane.add_section("Headset");
+        config_bool_select(leftPane, rightPane, vr.enabled,
+            {
+                .key = "Enable VR",
+                .helpText = "Play in your OpenXR headset (SteamVR, Quest Link, Virtual Desktop...). "
+                            "Takes effect after a restart.",
+            });
+        config_choice_select(leftPane, rightPane, vr.viewMode, "Perspective",
+            "First person puts you inside Link. Third person floats you behind him with the "
+            "game's camera. Tap the sword-hand stick to switch in game.",
+            {"First person", "Third person"});
+        config_float_select(leftPane, rightPane, vr.worldScale, "World Scale",
+            "How big the world feels. 100% is life size; lower makes you feel bigger.", 50, 200, 5,
+            1.0f, "%");
+        config_float_select(leftPane, rightPane, vr.heightOffset, "Height Offset",
+            "Raise or lower your eyes relative to Link's.", -80, 80, 5, 1.0f, " cm");
+        leftPane.register_control(leftPane.add_button("Recenter").on_pressed([] {
+            mDoAud_seStartMenu(kSoundItemChange);
+            vr::recenter();
+        }),
+            rightPane, [](Pane& pane) {
+                pane.clear();
+                pane.add_text("Face forward and press to line Link up with you. You can also hold "
+                              "the sword-hand stick for a second.");
+            });
+
+        leftPane.add_section("Comfort");
+        config_choice_select(leftPane, rightPane, vr.turnMode, "Turning",
+            "Turn with the sword-hand stick: in steps (most comfortable), smoothly, or not at all "
+            "(turn your body).",
+            {"Snap", "Smooth", "Off"});
+        config_int_select(leftPane, rightPane, vr.snapTurnDegrees, "Snap Turn Angle",
+            "How far each snap turn rotates you.", 15, 90, 15, {}, {}, "\u00b0");
+        config_float_select(leftPane, rightPane, vr.smoothTurnSpeed, "Smooth Turn Speed",
+            "How fast smooth turning rotates you.", 30, 360, 15, 1.0f, "\u00b0/s");
+        config_bool_select(leftPane, rightPane, vr.comfortVignette,
+            {
+                .key = "Comfort Vignette",
+                .helpText = "Darken the edges of your view while the stick, turning, climbing, "
+                            "swimming or riding moves you.",
+            });
+        config_bool_select(leftPane, rightPane, vr.handOrientedMovement,
+            {
+                .key = "Move Where You Point",
+                .helpText = "Walk toward where your off hand points instead of where you look.",
+            });
+
+        leftPane.add_section("Body");
+        config_bool_select(leftPane, rightPane, vr.fullBody,
+            {
+                .key = "Full Body",
+                .helpText = "See Link's body in first person, arms reaching for your controllers. "
+                            "Off shows floating hands only.",
+            });
+        config_bool_select(leftPane, rightPane, vr.stillIdle,
+            {
+                .key = "No Idle Animations",
+                .helpText = "Standing still, Link holds a neutral stance instead of fidgeting.",
+            });
+        config_bool_select(leftPane, rightPane, vr.legsOnlyWalk,
+            {
+                .key = "Legs-Only Walking",
+                .helpText = "Walking and running animate only the legs; your head and arms stay "
+                            "yours.",
+            });
+        config_bool_select(leftPane, rightPane, vr.roomScale,
+            {
+                .key = "Room Scale",
+                .helpText = "Walking around your room moves Link. Walls still stop you.",
+            });
+        config_bool_select(leftPane, rightPane, vr.physicalCrouch,
+            {
+                .key = "Physical Crouch",
+                .helpText = "Crouch for real to make Link crouch.",
+            });
+
+        leftPane.add_section("Motion Controls");
+        config_bool_select(leftPane, rightPane, vr.motionControls,
+            {
+                .key = "Motion Controls",
+                .helpText = "Swing to attack, raise the shield to guard, draw the bow, aim by "
+                            "pointing, climb and swim with your arms.",
+            });
+        config_bool_select(leftPane, rightPane, vr.leftHanded,
+            {
+                .key = "Left Handed",
+                .helpText = "Hold the sword in your left hand and the shield in your right.",
+            });
+        config_float_select(leftPane, rightPane, vr.swingSpeed, "Swing Speed",
+            "How fast the sword tip must move to count as a swing. Lower is more sensitive.", 100,
+            500, 10, 0.01f, " cm/s");
+        config_float_select(leftPane, rightPane, vr.handOffsetPitch, "Sword Pitch",
+            "Tilt the sword in your hand up or down.", -180, 180, 5, 1.0f, "\u00b0");
+        config_float_select(leftPane, rightPane, vr.handOffsetYaw, "Sword Yaw",
+            "Turn the sword in your hand left or right.", -180, 180, 5, 1.0f, "\u00b0");
+        config_float_select(leftPane, rightPane, vr.handOffsetRoll, "Sword Roll",
+            "Roll the sword's edge around its blade.", -180, 180, 5, 1.0f, "\u00b0");
+        config_float_select(leftPane, rightPane, vr.shieldOffsetPitch, "Shield Pitch",
+            "Tilt the shield on your arm.", -180, 180, 5, 1.0f, "\u00b0");
+        config_float_select(leftPane, rightPane, vr.shieldOffsetYaw, "Shield Yaw",
+            "Turn the shield on your arm.", -180, 180, 5, 1.0f, "\u00b0");
+        config_float_select(leftPane, rightPane, vr.shieldOffsetRoll, "Shield Roll",
+            "Roll the shield on your arm.", -180, 180, 5, 1.0f, "\u00b0");
+
+        leftPane.add_section("HUD Panel");
+        config_float_select(leftPane, rightPane, vr.hudDistance, "Panel Distance",
+            "How far the floating HUD and menu panel sits from you.", 50, 300, 10, 0.01f, " cm");
+        config_float_select(leftPane, rightPane, vr.hudWidth, "Panel Width",
+            "How wide the panel is.", 50, 300, 10, 0.01f, " cm");
+        config_float_select(leftPane, rightPane, vr.hudHeight, "Panel Height",
+            "Raise or lower the panel relative to your eyes.", -100, 100, 5, 0.01f, " cm");
+
+        leftPane.add_section("Desktop & Streaming");
+        config_choice_select(leftPane, rightPane, vr.desktopView, "Desktop Shows",
+            "What the desktop window shows. Headset view costs nothing; the other cameras are "
+            "rendered separately for streaming.",
+            {"Headset view", "Smooth first person", "Third person", "Selfie camera", "Raw right eye",
+                "HUD panel"});
+        config_bool_select(leftPane, rightPane, vr.spectatorHud,
+            {
+                .key = "Desktop HUD",
+                .helpText = "Show the game's HUD on the streaming cameras.",
+            });
+        config_float_select(leftPane, rightPane, vr.spectatorFov, "Desktop Field of View",
+            "Field of view of the streaming cameras.", 40, 110, 5, 1.0f, "\u00b0");
+        config_percent_select(leftPane, rightPane, vr.spectatorSmoothing, "Desktop Smoothing",
+            "How much the smooth first-person camera filters your head movement. 0% follows the "
+            "headset exactly.",
+            0, 100, 5);
+        config_bool_select(leftPane, rightPane, vr.spectatorLevel,
+            {
+                .key = "Level Desktop Horizon",
+                .helpText = "Keep the smooth first-person camera's horizon level.",
+            });
+        config_int_select(leftPane, rightPane, vr.spectatorRate, "Desktop Update Rate",
+            "Draw the streaming cameras every N headset frames.", 1, 4, 1);
+
+        leftPane.add_section("Rendering");
+        config_float_select(leftPane, rightPane, vr.resolutionScale, "Resolution Scale",
+            "Render resolution relative to what the headset recommends. Takes effect after a "
+            "restart.",
+            50, 150, 5, 0.01f, "%");
     });
 
     add_tab("Tools", [this](Rml::Element* content) {
