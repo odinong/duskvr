@@ -377,6 +377,8 @@ struct UserSettings {
         ConfigVar<float> hudHeight;       // meters, relative to the eyes
         ConfigVar<int> mirror;            // desktop window: 0 = right eye, 1 = HUD panel
         ConfigVar<bool> fullBody;         // first person shows Link's body, arms reaching the controllers
+        ConfigVar<bool> stillIdle;        // first person: no idle animations, Link stands still
+        ConfigVar<bool> legsOnlyWalk;     // first person: walking animates the legs only
         ConfigVar<bool> comfortVignette;  // darken the edges while moving with the stick
     } vr;
 

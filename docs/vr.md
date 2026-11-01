@@ -81,6 +81,17 @@ the arm on its side through two-bone IK (elbows hang down and out like a relaxed
 the elbows and shoulders follows, and the legs keep the game's walking and running animations.
 Turn the body off ("Full body" in Tools > VR) for floating hands only.
 
+Two toggles keep the body from fighting you (both on by default):
+
+- **No idle animations**: standing still, Link holds a neutral stance (feet planted, arms at his
+  sides) instead of fidgeting, stretching or looking around.
+- **Walking animates the legs only**: moving, the spine, head and arms stay steady (riding the hips'
+  height) and only the legs (and the tunic's skirt) run the walk and run animations. The camera no
+  longer picks up the animation's head bob.
+
+The neutral stance is the model's own rest pose with the arms lowered; it is worked out from the
+skeleton, so it applies to Wolf Link as well (his legs keep moving, his back and head stay level).
+
 Link holds the sword in your sword hand: in VR the game's sword and shield attachment points follow
 the "Left handed" setting.
 

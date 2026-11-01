@@ -25,6 +25,7 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -65,6 +66,18 @@ HandPlacement g_placements[2];
 
 void latch_hands(daAlink_c* link, float step);
 void hide_head(J3DModel* model);
+
+// A joint's rest (bind) pose in model space: the inverse of its stored inverse bind matrix.
+void bind_matrix(J3DModelData* data, int joint, Mtx out) {
+    const auto& src = data->getInvJointMtx(joint);
+    Mtx inv;
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            inv[r][c] = src[r][c];
+        }
+    }
+    MTXInverse(inv, out);
+}
 
 bool g_initialized = false;
 bool g_active = false;
@@ -590,7 +603,8 @@ void before_sim_tick() {
     g_body.z = head.z;
 }
 
-// Debug aid: DUSK_VR_DUMP_JOINTS=1 logs Link's skeleton (index, name, parent) once per form.
+// Debug aid: DUSK_VR_DUMP_JOINTS=1 logs Link's skeleton (index, name, parent, rest position) once
+// per form.
 void dump_skeleton(J3DModel* model, const char* label) {
     J3DModelData* data = model->getModelData();
     const u16 count = data->getJointNum();
@@ -603,7 +617,10 @@ void dump_skeleton(J3DModel* model, const char* label) {
     }
     JUTNameTab* names = data->getJointName();
     for (u16 i = 0; i < count; ++i) {
-        Log.info("{} joint {} '{}' parent {}", label, i, names ? names->getName(i) : "?", parent[i]);
+        Mtx bind;
+        bind_matrix(data, i, bind);
+        Log.info("{} joint {} '{}' parent {} rest ({:.1f}, {:.1f}, {:.1f})", label, i,
+            names ? names->getName(i) : "?", parent[i], bind[0][3], bind[1][3], bind[2][3]);
     }
 }
 
@@ -913,6 +930,167 @@ void solve_arm(J3DModel* model, const ArmChain& chain, const Mtx weaponTarget, c
     }
 }
 
+// Joint parents from the model's joint tree.
+void joint_parents(J3DModelData* data, std::vector<int>& parent) {
+    parent.assign(data->getJointNum(), -1);
+    for (u16 i = 0; i < data->getJointNum(); ++i) {
+        for (J3DJoint* c = data->getJointNodePointer(i)->getChild(); c != nullptr; c = c->getYounger()) {
+            parent[c->getJntNo()] = i;
+        }
+    }
+}
+
+// Link's neutral standing pose in model space: the model's rest pose (a T-pose), with human Link's
+// arms lowered to his sides.
+void neutral_pose(J3DModelData* data, int joint, bool wolf, const std::vector<int>& parent, Mtx out) {
+    bind_matrix(data, joint, out);
+    if (wolf) {
+        return;
+    }
+    for (int j = joint; j >= 0; j = parent[j]) {
+        if (j == kLeftArm.upper || j == kRightArm.upper) {
+            Mtx shoulder;
+            bind_matrix(data, j, shoulder);
+            const float angle = deg2rad(j == kLeftArm.upper ? -80.f : 80.f);
+            rotate_about(out, Quat::axisAngle({0.f, 0.f, 1.f}, angle), mtx_pos(shoulder), {});
+            return;
+        }
+    }
+}
+
+bool is_idle_proc(u16 proc) {
+    switch (proc) {
+    case daAlink_c::PROC_WAIT:
+    case daAlink_c::PROC_TIRED_WAIT:
+    case daAlink_c::PROC_SERVICE_WAIT:
+    case daAlink_c::PROC_ATN_ACTOR_WAIT:
+    case daAlink_c::PROC_WOLF_WAIT:
+    case daAlink_c::PROC_WOLF_TIRED_WAIT:
+    case daAlink_c::PROC_WOLF_SERVICE_WAIT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool is_walk_proc(u16 proc) {
+    switch (proc) {
+    case daAlink_c::PROC_MOVE:
+    case daAlink_c::PROC_ATN_MOVE:
+    case daAlink_c::PROC_ATN_ACTOR_MOVE:
+    case daAlink_c::PROC_WAIT_TURN:
+    case daAlink_c::PROC_MOVE_TURN:
+    case daAlink_c::PROC_WOLF_MOVE:
+    case daAlink_c::PROC_WOLF_ATN_AC_MOVE:
+    case daAlink_c::PROC_WOLF_WAIT_TURN:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Steadies the body in first person. Standing still, Link holds a neutral stance instead of his
+// idle fidgets. Walking or running, only the legs animate: the spine, head and arms stay in the
+// neutral pose, riding the hips' height, while anything that reaches the ground (legs, and the
+// tunic skirt hanging off the hips) keeps the animation. Returns whether the pose changed.
+bool steady_body(daAlink_c* link, J3DModel* model) {
+    const auto& vr = getSettings().vr;
+    const bool idle = vr.stillIdle.getValue() && is_idle_proc(link->mProcID);
+    const bool walk = vr.legsOnlyWalk.getValue() && is_walk_proc(link->mProcID);
+    if (!idle && !walk) {
+        return false;
+    }
+    const bool wolf = link->checkWolf();
+    J3DModelData* data = model->getModelData();
+    const u16 count = data->getJointNum();
+    static std::vector<int> parent;
+    joint_parents(data, parent);
+
+    static std::vector<std::array<std::array<f32, 4>, 3>> before;
+    before.resize(count);
+    for (u16 j = 0; j < count; ++j) {
+        std::memcpy(before[j].data(), model->getAnmMtx(j), sizeof(Mtx));
+    }
+    const auto old = [&](int j) { return reinterpret_cast<MtxP>(before[j].data()); };
+
+    MtxP base = model->getBaseTRMtx();
+    Mtx rootRest;
+    bind_matrix(data, 0, rootRest);
+    Mtx rootRestWorld;
+    MTXConcat(base, rootRest, rootRestWorld);
+    // Idle: feet planted at Link's position. Walking: follow the hips' bob.
+    const Vec3 offset = idle ? Vec3{} : mtx_pos(old(0)) - mtx_pos(rootRestWorld);
+    const auto setNeutral = [&](int j) {
+        Mtx rest, world;
+        neutral_pose(data, j, wolf, parent, rest);
+        MTXConcat(base, rest, world);
+        world[0][3] += offset.x;
+        world[1][3] += offset.y;
+        world[2][3] += offset.z;
+        MTXCopy(world, model->getAnmMtx(j));
+    };
+
+    if (idle) {
+        for (u16 j = 0; j < count; ++j) {
+            setNeutral(j);
+        }
+        return true;
+    }
+
+    // The spine: every joint from the root to the head.
+    std::vector<bool> onSpine(count, false);
+    for (int j = kHeadJoint; j > 0 && j < count; j = parent[j]) {
+        onSpine[j] = true;
+    }
+    for (u16 j = 1; j < count; ++j) {
+        if (onSpine[j]) {
+            setNeutral(j);
+        }
+    }
+    const float ground = rootRest[1][3] * 0.35f;
+    std::vector<u16> subtree;
+    for (u16 c = 1; c < count; ++c) {
+        const int p = parent[c];
+        if (onSpine[c] || p <= 0 || !onSpine[p]) {
+            continue;
+        }
+        collect_subtree(data, c, subtree);
+        bool reachesGround = false;
+        for (u16 j : subtree) {
+            Mtx rest;
+            bind_matrix(data, j, rest);
+            reachesGround = reachesGround || rest[1][3] < ground;
+        }
+        if (reachesGround) {
+            // A leg on the spine (wolf forelegs): keep animating, carried by the steadied spine.
+            Mtx inv, delta;
+            MTXInverse(old(p), inv);
+            MTXConcat(model->getAnmMtx(p), inv, delta);
+            for (u16 j : subtree) {
+                MTXConcat(delta, old(j), model->getAnmMtx(j));
+            }
+        } else {
+            for (u16 j : subtree) {
+                setNeutral(j);
+            }
+        }
+    }
+    return true;
+}
+
+// Skinned vertices (elbows, shoulders) follow the new joints, and interpolation sees the posed
+// skeleton rather than the animation's.
+void finish_pose(J3DModel* model) {
+    model->calcWeightEnvelopeMtx();
+    J3DModelData* data = model->getModelData();
+    for (u16 i = 0; i < data->getJointNum(); ++i) {
+        interp::record_final_mtx(model->getAnmMtx(i));
+    }
+    for (u16 i = 0; i < data->getWEvlpMtxNum(); ++i) {
+        interp::record_final_mtx(model->getWeightAnmMtx(i));
+    }
+}
+
 void restore_item_joints(daAlink_c* link) {
     if (g_itemsSwapped && !link->checkWolf()) {
         link->mLeftItemJntNo = kLeftArm.weapon;
@@ -925,11 +1103,18 @@ void restore_item_joints(daAlink_c* link) {
 
 void override_link_hands(daAlink_c* link) {
     J3DModel* model = link->mpLinkModel;
-    if (!first_person() || !getSettings().vr.motionControls || link->checkWolf() ||
-        model == nullptr || !g_linkValid)
-    {
+    if (!first_person() || model == nullptr || !g_linkValid) {
         restore_item_joints(link);
         g_placements[xr::kLeft].valid = g_placements[xr::kRight].valid = false;
+        return;
+    }
+    bool posed = getSettings().vr.fullBody && steady_body(link, model);
+    if (!getSettings().vr.motionControls || link->checkWolf()) {
+        restore_item_joints(link);
+        g_placements[xr::kLeft].valid = g_placements[xr::kRight].valid = false;
+        if (posed) {
+            finish_pose(model);
+        }
         return;
     }
 
@@ -945,7 +1130,6 @@ void override_link_hands(daAlink_c* link) {
     const Vec3 fwd{cM_ssin(link->shape_angle.y), 0.f, cM_scos(link->shape_angle.y)};
     const Vec3 right{-fwd.z, 0.f, fwd.x};
 
-    bool posed = false;
     for (const xr::Hand hand : {xr::kLeft, xr::kRight}) {
         const auto& state = in.hands[hand];
         g_placements[hand].valid = false;
@@ -959,18 +1143,8 @@ void override_link_hands(daAlink_c* link) {
         g_placements[hand].valid = true;
         posed = true;
     }
-    if (!posed) {
-        return;
-    }
-    // Skinned vertices (elbows, shoulders) follow the new joints, and interpolation sees the posed
-    // skeleton rather than the animation's.
-    model->calcWeightEnvelopeMtx();
-    J3DModelData* data = model->getModelData();
-    for (u16 i = 0; i < data->getJointNum(); ++i) {
-        interp::record_final_mtx(model->getAnmMtx(i));
-    }
-    for (u16 i = 0; i < data->getWEvlpMtxNum(); ++i) {
-        interp::record_final_mtx(model->getWeightAnmMtx(i));
+    if (posed) {
+        finish_pose(model);
     }
 }
 
@@ -1158,6 +1332,8 @@ void draw_imgui_window(bool* open) {
     ImGui::SeparatorText("Motion controls");
     checkbox("Motion controls", vr.motionControls);
     checkbox("Full body (first person)", vr.fullBody);
+    checkbox("No idle animations (stand still)", vr.stillIdle);
+    checkbox("Walking animates the legs only", vr.legsOnlyWalk);
     checkbox("Comfort vignette while moving", vr.comfortVignette);
     checkbox("Left handed (sword in left controller)", vr.leftHanded);
     sliderF("Swing speed", vr.swingSpeed, 1.0f, 5.0f, "%.1f m/s");

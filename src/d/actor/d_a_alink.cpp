@@ -18620,6 +18620,10 @@ int daAlink_c::execute() {
                 wolfFootBgCheck();
                 setWolfTailAngle();
                 modelCalc(mpLinkModel);
+#if TARGET_PC
+                // VR: steady body pose in first person.
+                dusk::vr::override_link_hands(this);
+#endif
                 checkWolfUseAbility();
 
                 if (checkWolfEyeUp() != 0) {
