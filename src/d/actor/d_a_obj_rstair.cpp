@@ -6,6 +6,7 @@
 #include "d/dolzel_rel.h" // IWYU pragma: keep
 
 #include "d/actor/d_a_obj_rstair.h"
+#include "dusk/interp/material.h"
 #include "d/d_bg_w.h"
 #include "d/d_com_inf_game.h"
 #include "m_Do/m_Do_graphic.h"
@@ -319,6 +320,10 @@ int daObjRotStair_c::Draw() {
                 mDoGph_gInf_c::setWideZoomLightProjection(lightMtx);
                 #endif
                 texMtxInfo->setEffectMtx(lightMtx);
+                #if TARGET_PC
+                // Recomputed for each view (a VR eye has its own frustum).
+                dusk::interp::material::set_view_projection(texMtxInfo, 1.0f, 1.0f, -0.01f, 0.0f);
+                #endif
                 modelData->simpleCalcMaterial(0, (MtxP)j3dDefaultMtx);
             }
         }

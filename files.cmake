@@ -1449,7 +1449,9 @@ set(DUSK_FILES
         src/dusk/vr/xr_session.h
         src/dusk/vr/vr_input.cpp
         src/dusk/vr/vr_gamepad.cpp
+        src/dusk/vr/vr_wheel.cpp
         src/dusk/vr/vr_gamepad.h
+        src/dusk/vr/vr_wheel.h
         src/dusk/vr/vr_input.h
         src/dusk/game_combos.cpp
         src/dusk/trigger_viewer.cpp

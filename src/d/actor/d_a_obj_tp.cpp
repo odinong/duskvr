@@ -6,6 +6,7 @@
 #include "d/dolzel_rel.h" // IWYU pragma: keep
 
 #include "d/actor/d_a_obj_tp.h"
+#include "dusk/interp/material.h"
 #include "JSystem/J3DGraphAnimator/J3DAnimation.h"
 #include "JSystem/J3DGraphAnimator/J3DModelData.h"
 #include "JSystem/J3DGraphBase/J3DMaterial.h"
@@ -42,6 +43,10 @@ static int daObj_Tp_Draw(obj_tp_class* i_this) {
                         mDoGph_gInf_c::setWideZoomLightProjection(lightProjMtx);
                         #endif
                         texMtxInfo->setEffectMtx(lightProjMtx);
+                        #if TARGET_PC
+                        // Recomputed for each view (a VR eye has its own frustum).
+                        dusk::interp::material::set_view_projection(texMtxInfo, 1.0f, 1.0f, -0.01f, 0.0f);
+                        #endif
                         modelData->simpleCalcMaterial(0, (MtxP)j3dDefaultMtx);
                     }
                 }

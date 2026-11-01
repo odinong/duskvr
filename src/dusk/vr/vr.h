@@ -69,10 +69,18 @@ bool hand_aim(s16& yaw, s16& pitch);
 // Debug/settings UI.
 void draw_imgui_window(bool* open);
 void recenter();
+
+// Called once the game camera is stored each sim tick: culling then follows the headset.
+void setup_sim_culling(view_class* view);
+
+// Draws what floats in the world for you alone (the item wheel) into the current eye.
+void draw_eye_overlays();
 #else
 inline void initialize() {}
 inline void shutdown() {}
 inline bool active() { return false; }
+inline void setup_sim_culling(view_class*) {}
+inline void draw_eye_overlays() {}
 inline bool begin_frame() { return false; }
 inline int eye_count() { return 0; }
 inline void begin_eye(int) {}

@@ -10,6 +10,13 @@
 typedef struct Vec Vec;
 struct ResTIMG;
 
+#if DUSK_VR
+namespace dusk::vr {
+// While the game simulates, maps its camera's view to the headset's, or null.
+MtxP sim_cull_correction();
+}
+#endif
+
 struct mDoLib_clipper {
     static void setup(f32, f32, f32, f32);
 
@@ -19,10 +26,25 @@ struct mDoLib_clipper {
     }
 
     static int clip(const Mtx m, const Vec* param_1, const Vec* param_2) {
+#if DUSK_VR
+        // In VR, cull against where the headset looks, not where the game's camera does.
+        if (MtxP correction = dusk::vr::sim_cull_correction()) {
+            Mtx headView;
+            MTXConcat(correction, m, headView);
+            return mClipper.clip(headView, (Vec*)param_1, (Vec*)param_2);
+        }
+#endif
         return mClipper.clip(m, (Vec*)param_1, (Vec*)param_2);
     }
 
     static s32 clip(const Mtx m, Vec param_1, f32 param_2) {
+#if DUSK_VR
+        if (MtxP correction = dusk::vr::sim_cull_correction()) {
+            Mtx headView;
+            MTXConcat(correction, m, headView);
+            return mClipper.clip(headView, param_1, param_2);
+        }
+#endif
         return mClipper.clip(m, param_1, param_2);
     }
 

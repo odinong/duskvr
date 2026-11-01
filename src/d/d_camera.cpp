@@ -39,6 +39,9 @@
 #include "dusk/mouse.h"
 #include "dusk/settings.h"
 #include "dusk/touch_camera.h"
+#if DUSK_VR
+#include "dusk/vr/vr.h"
+#endif
 
 #include <imgui.h>
 #endif
@@ -11199,6 +11202,9 @@ static void view_setup(camera_process_class* i_this) {
     }
 
     mDoLib_clipper::setup(view->fovy, view->aspect, view->near_, far_);
+#if DUSK_VR
+    dusk::vr::setup_sim_culling(view);
+#endif
 }
 
 static void store(camera_process_class* i_camera) {

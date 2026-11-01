@@ -8,6 +8,7 @@
 #include "dusk/config.hpp"
 #include "dusk/vr/vr_gamepad.h"
 #include "dusk/vr/vr_input.h"
+#include "dusk/vr/vr_wheel.h"
 #include "dusk/vr/xr_session.h"
 
 #include "d/actor/d_a_alink.h"
@@ -153,6 +154,14 @@ bool g_preIkEyeValid = false;
 
 double g_lastDisplayTime = 0.0;
 bool g_firstPersonFrame = false;
+// Tracking space (meters) to the game world, for the eye being drawn.
+Mtx g_eyeTrackingToWorld;
+bool g_eyeTrackingValid = false;
+// Frames left to hold X (positive) or Y (negative) after picking an item from the wheel.
+int g_pullFrames = 0;
+// The game camera's view mapped to the headset's, for culling during the sim tick.
+bool g_cullValid = false;
+Mtx g_cullCorrection;
 input::Context g_ctx;
 
 daAlink_c* get_link() {
@@ -231,6 +240,7 @@ void activate() {
 
 void deactivate() {
     g_active = false;
+    wheel::close();
     aurora::xr::set_framebuffer_override(0, 0);
     aurora_enable_vsync(getSettings().video.enableVsync);
     aurora_set_pause_on_focus_lost(g_prevPauseOnFocusLost);
@@ -529,16 +539,13 @@ void update_gamepad(const input::FrameResult& result) {
     st.leftTrigger = in.trigger[o];
     st.rightTrigger = in.squeeze[o];
     st.south = in.buttonLower[s];
-    st.west = in.buttonLower[o];
-    st.north = in.buttonUpper[o];
-    if (menus) {
-        // In Dusklight's menus the trigger only clicks the laser; B goes back.
-        st.east = in.buttonUpper[s];
-    } else {
-        st.east = in.trigger[s] > 0.6f && !triggerBusy;
-        st.rightShoulder = in.buttonUpper[s];
-    }
-    st.leftShoulder = in.squeeze[s] > 0.6f;
+    st.west = in.buttonLower[o] || g_pullFrames > 0;
+    st.north = in.buttonUpper[o] || g_pullFrames < 0;
+    g_pullFrames += g_pullFrames > 0 ? -1 : g_pullFrames < 0 ? 1 : 0;
+    // B is B. The trigger is B too while playing (in Dusklight's menus it only clicks the laser).
+    st.east = in.buttonUpper[s] || (!menus && in.trigger[s] > 0.6f && !triggerBusy);
+    // Midna (Z) on the off hand's stick click; the sword hand's grip opens the item wheel.
+    st.rightShoulder = !menus && in.stickClick[o];
     st.leftStick = in.stickClick[o];
     st.rightStick = in.stickClick[s];
     st.start = startFrames > 0;
@@ -658,6 +665,21 @@ bool begin_frame() {
     update_pointer();
 
     const auto result = input::update_frame(xr::input(), xr::head(), dt, g_ctx);
+    {
+        const auto& in = xr::input();
+        const auto hand = static_cast<xr::Hand>(input::sword_hand());
+        const bool allowed = g_controllable && !g_wolf && !g_climbing && !g_swimming &&
+                             !g_riding && !g_carrying && !g_bowReady && !input::bow_drawing() &&
+                             !ui::any_document_visible() && in.hands[hand].active;
+        if (std::getenv("DUSK_VR_TEST_WHEEL") != nullptr && g_controllable) {
+            // Debug aid: holds the wheel open in front of the headset.
+            Pose fake = xr::head();
+            fake.position = fake.position + fake.forward() * 0.45f;
+            wheel::update(true, hand, 1.f, fake, xr::head());
+        } else {
+            wheel::update(allowed, hand, in.squeeze[hand], in.hands[hand].grip, xr::head());
+        }
+    }
     update_gamepad(result);
     turn(result.turnRad);
     {
@@ -754,6 +776,9 @@ void before_sim_tick() {
     if (!g_active) {
         return;
     }
+    if (const int pull = wheel::take_pull_out(); pull != 0) {
+        g_pullFrames = pull;
+    }
     input::sync_virtual_pad(g_ctx);
 
     // Room scale: physically walking moves Link; the collision pass pushes him out of walls, so
@@ -845,6 +870,7 @@ void dump_skeleton(J3DModel* model, const char* label) {
 }
 
 void after_sim_tick() {
+    g_cullValid = false;
     // The HUD only changes when the game does.
     g_hudPending = true;
     daAlink_c* link = get_link();
@@ -854,6 +880,13 @@ void after_sim_tick() {
         g_locked = false;
         g_bowReady = false;
         return;
+    }
+    // Debug aid: DUSK_VR_LOG_PROC=1 logs Link's action whenever it changes.
+    static int lastProc = -1;
+    if (std::getenv("DUSK_VR_LOG_PROC") != nullptr && link->mProcID != lastProc) {
+        lastProc = link->mProcID;
+        Log.info("proc {:#x} controllable {} first person {}", lastProc, g_controllable,
+            g_firstPersonFrame);
     }
     g_bowReady = !link->checkWolf() && link->checkBowAndSlingItem(link->mEquipItem) &&
                  link->checkBowAnime();
@@ -985,6 +1018,7 @@ void finish_view(view_class* view, const Quat& rot, const Vec3& pos, float fovy,
     view->viewMtxNoTrans[2][3] = 0.0f;
     cMtx_concatProjView(view->projMtx, view->viewMtx, view->projViewMtx);
     mDoLib_clipper::setup(fovy + 10.f, aspect, view->near_, view->far_);
+    g_cullValid = false;
 }
 
 // Heading and pitch only: a streamer's camera never rolls.
@@ -1000,6 +1034,29 @@ Quat nlerp(const Quat& a, const Quat& b, float t) {
         a.z + (b.z * s - a.z) * t, a.w + (b.w * s - a.w) * t});
 }
 
+// Where tracking space (meters) sits in the world this frame: under Link in first person, on the
+// game camera in third person.
+void tracking_frame(const view_class* view, float step, Quat& yaw, Vec3& origin) {
+    if (g_firstPersonFrame) {
+        yaw = Quat::yaw(g_yawOffset);
+        origin = interpolated_anchor(step);
+    } else {
+        yaw = Quat::yaw(game_camera_yaw(view) - g_headYawAtRecenter);
+        origin = to_vec(view->lookat.eye);
+    }
+}
+
+void set_tracking_to_world(const Quat& yaw, const Vec3& origin) {
+    const float scale = units_per_meter();
+    build_world_matrix(g_eyeTrackingToWorld, yaw, origin - yaw.rotate(g_body) * scale);
+    for (int r = 0; r < 3; ++r) {
+        for (int col = 0; col < 3; ++col) {
+            g_eyeTrackingToWorld[r][col] *= scale;
+        }
+    }
+    g_eyeTrackingValid = true;
+}
+
 // The desktop's 16:9 camera, LIV style: a smoothed first-person view, the game's own (collision-
 // aware) third-person camera showing your whole body, or a selfie camera in front of you.
 bool apply_spectator_view(view_class* view, float step) {
@@ -1009,6 +1066,12 @@ bool apply_spectator_view(view_class* view, float step) {
     const double now = xr::predicted_display_seconds();
     const float dt = g_specLastTime > 0.0 ? static_cast<float>(std::clamp(now - g_specLastTime, 0.0, 0.2)) : 0.f;
     g_specLastTime = now;
+    {
+        Quat yaw;
+        Vec3 origin;
+        tracking_frame(view, step, yaw, origin);
+        set_tracking_to_world(yaw, origin);
+    }
 
     if (g_firstPersonFrame && getSettings().vr.motionControls) {
         if (daAlink_c* link = get_link(); link != nullptr && !link->checkWolf()) {
@@ -1077,19 +1140,16 @@ bool apply_eye_view(view_class* view, float step) {
     const xr::EyeView& eye = xr::eye(g_currentEye);
     const float scale = units_per_meter();
 
-    Vec3 eyePos;
-    Quat eyeRot;
+    // First person: under Link. Third person and cutscenes: on the game camera, horizon level.
+    Quat trackingYaw;
+    Vec3 trackingOrigin;
+    tracking_frame(view, step, trackingYaw, trackingOrigin);
+    set_tracking_to_world(trackingYaw, trackingOrigin);
+    Vec3 eyePos = trackingOrigin + trackingYaw.rotate(eye.pose.position - g_body) * scale;
+    const Quat eyeRot = trackingYaw * eye.pose.orientation;
     if (g_firstPersonFrame) {
         const float feetY = g_linkPrev.y + (g_linkCurr.y - g_linkPrev.y) * step;
-        eyePos = tracking_to_world_fp(eye.pose.position, interpolated_anchor(step));
         eyePos.y = std::max(eyePos.y, feetY + 20.f);
-        eyeRot = Quat::yaw(g_yawOffset) * eye.pose.orientation;
-    } else {
-        // Third person and cutscenes: head tracking on top of the game camera, horizon level.
-        const float base = game_camera_yaw(view) - g_headYawAtRecenter;
-        const Vec3 local = eye.pose.position - g_body;
-        eyePos = to_vec(view->lookat.eye) + Quat::yaw(base).rotate(local) * scale;
-        eyeRot = Quat::yaw(base) * eye.pose.orientation;
     }
 
     if (g_firstPersonFrame) {
@@ -1147,6 +1207,64 @@ s16 control_angle_y(s16 gameCameraAngle) {
 }
 
 bool first_person() { return g_active && g_firstPersonFrame; }
+
+void draw_eye_overlays() {
+    view_class* view = game_view();
+    if (!g_active || (g_pass != Pass::Eye && g_pass != Pass::Spectator) || !g_eyeTrackingValid ||
+        view == nullptr) {
+        return;
+    }
+    if (view_port_class* port = dComIfGd_getViewport(); port != nullptr) {
+        GXSetViewport(port->x_orig, port->y_orig, port->width, port->height, port->near_z, port->far_z);
+        GXSetScissor(static_cast<u32>(port->scissor.x_orig), static_cast<u32>(port->scissor.y_orig),
+            static_cast<u32>(port->scissor.width), static_cast<u32>(port->scissor.height));
+    }
+    wheel::draw(view->viewMtx, view->projMtx, g_eyeTrackingToWorld);
+}
+
+// The game culls what it draws against its own camera while it simulates, but you look around
+// with the headset: anything outside the game camera's view (beside or behind you in first
+// person) would never be drawn. Cull against the headset instead, with both eyes' field of view
+// widened to cover how far the head can turn before the next sim tick.
+void setup_sim_culling(view_class* view) {
+    g_cullValid = false;
+    if (!g_active || view == nullptr || !xr::head_valid() || !xr::views_valid()) {
+        return;
+    }
+    const Pose& head = xr::head();
+    Vec3 pos;
+    Quat rot;
+    if (g_firstPersonFrame) {
+        pos = tracking_to_world_fp(head.position, interpolated_anchor(1.f));
+        rot = Quat::yaw(g_yawOffset) * head.orientation;
+    } else {
+        const float base = game_camera_yaw(view) - g_headYawAtRecenter;
+        pos = to_vec(view->lookat.eye) + Quat::yaw(base).rotate(head.position - g_body) * units_per_meter();
+        rot = Quat::yaw(base) * head.orientation;
+    }
+    Mtx headView, gameInv;
+    build_view_matrix(headView, rot, pos);
+    if (!MTXInverse(view->viewMtx, gameInv)) {
+        return;
+    }
+    MTXConcat(headView, gameInv, g_cullCorrection);
+
+    float halfH = 0.f, halfV = 0.f;
+    for (int i = 0; i < 2; ++i) {
+        const xr::EyeView& eye = xr::eye(i);
+        halfH = std::max({halfH, std::fabs(eye.angleLeft), std::fabs(eye.angleRight)});
+        halfV = std::max({halfV, std::fabs(eye.angleUp), std::fabs(eye.angleDown)});
+    }
+    constexpr float kMargin = 25.f * kPi / 180.f;
+    constexpr float kMaxHalf = 85.f * kPi / 180.f;
+    halfH = std::min(halfH + kMargin, kMaxHalf);
+    halfV = std::min(halfV + kMargin, kMaxHalf);
+    mDoLib_clipper::setup(2.f * halfV * (180.f / kPi), std::tan(halfH) / std::tan(halfV),
+        std::max(view->near_, 1.f), mDoLib_clipper::getFar());
+    g_cullValid = true;
+}
+
+MtxP sim_cull_correction() { return g_cullValid ? g_cullCorrection : nullptr; }
 
 // The spectator camera shows all of Link; only your own eyes leave out what's in the way.
 bool hide_link_body() {
@@ -1279,45 +1397,30 @@ void neutral_pose(J3DModelData* data, int joint, bool wolf, const std::vector<in
     }
 }
 
-bool is_idle_proc(u16 proc) {
-    switch (proc) {
-    case daAlink_c::PROC_WAIT:
-    case daAlink_c::PROC_TIRED_WAIT:
-    case daAlink_c::PROC_SERVICE_WAIT:
-    case daAlink_c::PROC_ATN_ACTOR_WAIT:
-    case daAlink_c::PROC_WOLF_WAIT:
-    case daAlink_c::PROC_WOLF_TIRED_WAIT:
-    case daAlink_c::PROC_WOLF_SERVICE_WAIT:
-        return true;
-    default:
-        return false;
-    }
+// Animations that carry the whole body somewhere your own body can't follow keep playing in full:
+// climbing, hanging, swimming, crawling, riding, rowing, crouching.
+bool body_animated(daAlink_c* link) {
+    const u16 proc = link->mProcID;
+    return g_climbing || g_swimming || link->checkHorseRide() || proc == daAlink_c::PROC_CROUCH ||
+           (proc >= daAlink_c::PROC_CRAWL_START && proc <= daAlink_c::PROC_CRAWL_END) ||
+           proc == daAlink_c::PROC_SWIM_DIVE ||
+           (proc >= daAlink_c::PROC_CANOE_RIDE && proc <= daAlink_c::PROC_CANOE_GRAB_MOVE);
 }
 
-bool is_walk_proc(u16 proc) {
-    switch (proc) {
-    case daAlink_c::PROC_MOVE:
-    case daAlink_c::PROC_ATN_MOVE:
-    case daAlink_c::PROC_ATN_ACTOR_MOVE:
-    case daAlink_c::PROC_WAIT_TURN:
-    case daAlink_c::PROC_MOVE_TURN:
-    case daAlink_c::PROC_WOLF_MOVE:
-    case daAlink_c::PROC_WOLF_ATN_AC_MOVE:
-    case daAlink_c::PROC_WOLF_WAIT_TURN:
-        return true;
-    default:
-        return false;
-    }
-}
-
-// Steadies the body in first person. Standing still, Link holds a neutral stance instead of his
-// idle fidgets. Walking or running, only the legs animate: the spine, head and arms stay in the
-// neutral pose, riding the hips' height, while anything that reaches the ground (legs, and the
-// tunic skirt hanging off the hips) keeps the animation. Returns whether the pose changed.
+// Steadies the body in first person, whatever Link is doing (unless it's body_animated()).
+// Standing still, Link holds a neutral stance instead of his idle fidgets and stances. Moving or
+// acting (walking, attacking, using an item, talking), only the legs animate: the spine, head and
+// arms stay in the neutral pose, riding the hips' height, so your own head and hands drive them,
+// while anything that reaches the ground (legs, and the tunic skirt hanging off the hips) keeps
+// the animation. Returns whether the pose changed.
 bool steady_body(daAlink_c* link, J3DModel* model) {
     const auto& vr = getSettings().vr;
-    const bool idle = vr.stillIdle.getValue() && is_idle_proc(link->mProcID);
-    const bool walk = vr.legsOnlyWalk.getValue() && is_walk_proc(link->mProcID);
+    if (body_animated(link)) {
+        return false;
+    }
+    const bool still = std::fabs(link->speedF) < 0.5f && link->mLinkAcch.ChkGroundHit();
+    const bool idle = vr.stillIdle.getValue() && still;
+    const bool walk = vr.legsOnlyWalk.getValue() && !idle;
     if (!idle && !walk) {
         return false;
     }

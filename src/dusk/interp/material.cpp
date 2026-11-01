@@ -6,6 +6,9 @@
 
 #include "d/d_com_inf_game.h"
 #include "m_Do/m_Do_graphic.h"
+#if DUSK_VR
+#include "dusk/vr/vr.h"
+#endif
 
 #include "JSystem/J3DGraphAnimator/J3DAnimation.h"
 #include "JSystem/J3DGraphAnimator/J3DModel.h"
@@ -28,6 +31,23 @@ struct ViewProjection {
     void apply(J3DTexMtxInfo* info) const {
         Mtx projection;
         const auto* view = dComIfGd_getView();
+#if DUSK_VR
+        if (dusk::vr::active()) {
+            // A VR eye's frustum is off center: map through its actual projection, or the
+            // projected texture (water refraction) slides around as the head moves.
+            const auto& p = view->projMtx;
+            projection[0][0] = p[0][0] * scaleS;
+            projection[0][1] = projection[0][3] = 0.0f;
+            projection[0][2] = p[0][2] * scaleS - transS;
+            projection[1][1] = p[1][1] * scaleT;
+            projection[1][2] = p[1][2] * scaleT - transT;
+            projection[1][0] = projection[1][3] = 0.0f;
+            projection[2][0] = projection[2][1] = projection[2][3] = 0.0f;
+            projection[2][2] = -1.0f;
+            info->setEffectMtx(projection);
+            return;
+        }
+#endif
         C_MTXLightPerspective(projection, view->fovy, view->aspect, scaleS, scaleT, transS, transT);
 #if WIDESCREEN_SUPPORT
         mDoGph_gInf_c::setWideZoomLightProjection(projection);

@@ -2784,6 +2784,11 @@ int mDoGph_Painter() {
     dusk::mods::gfx_run_stage(GFX_STAGE_FRAME_BEFORE_HUD);
 #endif
 
+    if (vrAnyPass) {
+        dusk::vr::draw_eye_overlays();
+        ortho.setPort();
+    }
+
     if (vrEyePass) {
         // The HUD goes on the VR panel, but a fade over the HUD still has to darken the eyes.
         if (strcmp(dComIfGp_getStartStageName(), "F_SP127") == 0 || (mDoGph_gInf_c::isFade() & 0x80) != 0)

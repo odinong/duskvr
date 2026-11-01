@@ -1790,13 +1790,15 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
         config_bool_select(leftPane, rightPane, vr.stillIdle,
             {
                 .key = "No Idle Animations",
-                .helpText = "Standing still, Link holds a neutral stance instead of fidgeting.",
+                .helpText = "Standing still, Link holds a neutral stance instead of fidgeting or "
+                            "posing.",
             });
         config_bool_select(leftPane, rightPane, vr.legsOnlyWalk,
             {
-                .key = "Legs-Only Walking",
-                .helpText = "Walking and running animate only the legs; your head and arms stay "
-                            "yours.",
+                .key = "Legs-Only Animation",
+                .helpText = "Whatever Link does (walking, fighting, using items, talking), only "
+                            "his legs animate; your head and arms stay yours. Climbing, swimming, "
+                            "crawling and riding still play in full.",
             });
         config_bool_select(leftPane, rightPane, vr.roomScale,
             {

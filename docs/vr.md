@@ -48,9 +48,11 @@ The sword hand is the right controller by default (Settings: left handed).
 | Bow / slingshot out: grab the string near the bow with the sword hand (grip or trigger), pull back, let go | Draw and shoot; the arrow flies from the string through the bow |
 | Point the sword-hand controller while aiming | Aim clawshot, boomerang, other aimed items |
 | In menus: point at the panel, pull the sword-hand trigger | Click (laser pointer) |
-| Sword-hand trigger | B (sword, cancel) |
-| Sword-hand A / B | A (action) / Z (Midna) |
+| Squeeze the sword-hand grip | The item wheel floats around your hand: move onto an item and let go to pull it out (it goes on X), let go in the middle to cancel |
+| Sword-hand A / B | A (action) / B (sword, cancel) |
+| Sword-hand trigger | B too (in menus it only clicks the laser) |
 | Off-hand X / Y | X / Y items |
+| Off-hand stick click | Z (Midna) |
 | Off-hand trigger / grip | L (lock on) / R |
 | Menu (tap) | Start (pause / collection) |
 | Menu (hold) | Dusklight's own menu |
@@ -143,8 +145,8 @@ Tools > VR adjust it.
 ### Dusklight's menus
 
 The launcher, settings, mod manager and other Dusklight windows appear on the floating panel too,
-live every frame. Point and pull the sword-hand trigger to click, or use either stick to move,
-A to confirm, B to go back, the grips to switch tabs and Menu to close.
+live every frame. Point and pull the sword-hand trigger to click, B goes back and Menu closes. The
+sticks do nothing there, so a drifting stick can't wander off.
 
 ### HUD panel
 

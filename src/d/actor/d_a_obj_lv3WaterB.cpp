@@ -6,6 +6,7 @@
 #include "d/dolzel_rel.h" // IWYU pragma: keep
 
 #include "d/actor/d_a_obj_lv3WaterB.h"
+#include "dusk/interp/material.h"
 #include "JSystem/J3DGraphBase/J3DMaterial.h"
 #include "d/d_bg_w.h"
 #include "d/d_com_inf_game.h"
@@ -34,6 +35,10 @@ static int daObj_Lv3waterB_Draw(obj_lv3WaterB_class* i_this) {
             #endif
 
             tex_mtx_info->setEffectMtx(m);
+            #if TARGET_PC
+            // Recomputed for each view (a VR eye has its own frustum).
+            dusk::interp::material::set_view_projection(tex_mtx_info, 1.0f, 1.0f, -0.015f, 0.0f);
+            #endif
             i_this->mpBWaterModel->getModelData()->simpleCalcMaterial((MtxP)j3dDefaultMtx);
         }
     }

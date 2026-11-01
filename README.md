@@ -74,8 +74,10 @@ The controllers show up in Dusklight's Input menu as a gamepad (e.g. "Valve Inde
 | Right stick | Turn (click: switch first/third person, hold: recenter) |
 | Swing / thrust / circle | Sword attacks / stab / spin attack |
 | Raise the left hand | Lock on and guard |
+| Right grip | Item wheel: reach onto an item, let go to pull it out |
+| A / B | A / B |
 | Right trigger | B · laser click in menus |
-| A / B | A / Z (Midna) |
+| Left stick click | Z (Midna) |
 | X / Y | X / Y items |
 | Left trigger / left grip | L / R |
 | Menu | Tap: Start · hold: Dusklight menu |

@@ -11439,6 +11439,14 @@ void dKy_bg_MAxx_proc(void* bg_model_p) {
                             mDoGph_gInf_c::setWideZoomLightProjection(sp1D8);
                             #endif
                             tex_mtx_inf->setEffectMtx(sp1D8);
+#if TARGET_PC
+                            // Recomputed for each view (a VR eye has its own frustum).
+                            if (mat_name[6] == '2') {
+                                dusk::interp::material::set_view_projection(tex_mtx_inf, 1.0f, 1.0f, -0.01f, 0.0f);
+                            } else {
+                                dusk::interp::material::set_view_projection(tex_mtx_inf, 0.49f, -0.49f, 0.5f, 0.5f);
+                            }
+#endif
                             modelData->simpleCalcMaterial((MtxP)j3dDefaultMtx);
                         }
                     }
