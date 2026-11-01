@@ -385,6 +385,7 @@ struct UserSettings {
         ConfigVar<bool> fullBody;         // first person shows Link's body, arms reaching the controllers
         ConfigVar<bool> stillIdle;        // first person: no idle animations, Link stands still
         ConfigVar<bool> legsOnlyWalk;     // first person: walking animates the legs only
+        ConfigVar<bool> fingerHands;      // first person: hands built from tracked fingers
         ConfigVar<bool> comfortVignette;  // darken the edges while moving with the stick
     } vr;
 

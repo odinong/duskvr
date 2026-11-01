@@ -8,6 +8,7 @@
 #include "dusk/config.hpp"
 #include "dusk/vr/vr_gamepad.h"
 #include "dusk/vr/vr_input.h"
+#include "dusk/vr/vr_hands.h"
 #include "dusk/vr/vr_wheel.h"
 #include "dusk/vr/xr_session.h"
 
@@ -75,6 +76,8 @@ HandPlacement g_placements[2];
 
 void latch_hands(daAlink_c* link, float step);
 void hide_head(daAlink_c* link);
+void hide_stock_hands(daAlink_c* link);
+bool finger_hand_shown(daAlink_c* link, int hand);
 
 // A joint's rest (bind) pose in model space: the inverse of its stored inverse bind matrix.
 void bind_matrix(J3DModelData* data, int joint, Mtx out) {
@@ -1076,6 +1079,7 @@ bool apply_spectator_view(view_class* view, float step) {
     if (g_firstPersonFrame && getSettings().vr.motionControls) {
         if (daAlink_c* link = get_link(); link != nullptr && !link->checkWolf()) {
             latch_hands(link, step);
+            hide_stock_hands(link);
         }
     }
 
@@ -1158,6 +1162,7 @@ bool apply_eye_view(view_class* view, float step) {
             hide_head(link);
             if (!link->checkWolf() && getSettings().vr.motionControls) {
                 latch_hands(link, step);
+                hide_stock_hands(link);
             }
         }
     }
@@ -1219,6 +1224,29 @@ void draw_eye_overlays() {
         GXSetScissor(static_cast<u32>(port->scissor.x_orig), static_cast<u32>(port->scissor.y_orig),
             static_cast<u32>(port->scissor.width), static_cast<u32>(port->scissor.height));
     }
+    hands::Frame fingers;
+    daAlink_c* link = get_link();
+    const auto& in = xr::input();
+    for (const xr::Hand hand : {xr::kLeft, xr::kRight}) {
+        fingers.show[hand] = finger_hand_shown(link, hand);
+        if (fingers.show[hand]) {
+            // Link's wrist sits where the arm IK put his hand joint, relative to the grip.
+            Mtx local;
+            hand_from_grip(hand, local);
+            const Vec3 offset = Vec3{local[0][3], local[1][3], local[2][3]} * (1.f / units_per_meter());
+            const Pose& grip = in.hands[hand].grip;
+            fingers.wrist[hand] = grip.position + grip.orientation.rotate(offset);
+        }
+    }
+    if (std::getenv("DUSK_VR_TEST_HANDS") != nullptr) {
+        // Debug aid: shows each tracked hand in front of the headset.
+        for (const xr::Hand hand : {xr::kLeft, xr::kRight}) {
+            fingers.show[hand] = in.fingersTracked[hand];
+            fingers.wrist[hand] = xr::head().position + xr::head().forward() * 0.35f +
+                                  xr::head().right() * (hand == xr::kLeft ? -0.1f : 0.1f);
+        }
+    }
+    hands::draw(fingers, view->viewMtx, view->projMtx, g_eyeTrackingToWorld);
     wheel::draw(view->viewMtx, view->projMtx, g_eyeTrackingToWorld);
 }
 
@@ -1742,6 +1770,25 @@ void collapse(MtxP m) {
     interp::set_presentation_override(m, collapsed);
 }
 
+// Whether this hand is drawn from tracked fingers (vr_hands) instead of Link's own hand shapes.
+bool finger_hand_shown(daAlink_c* link, int hand) {
+    const auto& in = xr::input();
+    return getSettings().vr.fingerHands && first_person() && link != nullptr && !link->checkWolf() &&
+           getSettings().vr.motionControls && g_placements[hand].valid && in.hands[hand].active &&
+           in.fingersTracked[hand];
+}
+
+void hide_stock_hands(daAlink_c* link) {
+    if (link->mpLinkHandModel == nullptr) {
+        return;
+    }
+    for (const xr::Hand hand : {xr::kLeft, xr::kRight}) {
+        if (finger_hand_shown(link, hand)) {
+            collapse(link->mpLinkHandModel->getAnmMtx(arm_for(hand).handModelJoint));
+        }
+    }
+}
+
 void collapse_model(J3DModel* model) {
     if (model == nullptr) {
         return;
@@ -1955,6 +2002,7 @@ void draw_imgui_window(bool* open) {
     checkbox("Full body (first person)", vr.fullBody);
     checkbox("No idle animations (stand still)", vr.stillIdle);
     checkbox("Walking animates the legs only", vr.legsOnlyWalk);
+    checkbox("Hands from tracked fingers", vr.fingerHands);
     checkbox("Comfort vignette while moving", vr.comfortVignette);
     checkbox("Left handed (sword in left controller)", vr.leftHanded);
     sliderF("Swing speed", vr.swingSpeed, 1.0f, 5.0f, "%.1f m/s");

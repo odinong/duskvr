@@ -1450,6 +1450,8 @@ set(DUSK_FILES
         src/dusk/vr/vr_input.cpp
         src/dusk/vr/vr_gamepad.cpp
         src/dusk/vr/vr_wheel.cpp
+        src/dusk/vr/vr_hands.cpp
+        src/dusk/vr/vr_hands.h
         src/dusk/vr/vr_gamepad.h
         src/dusk/vr/vr_wheel.h
         src/dusk/vr/vr_input.h

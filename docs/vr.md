@@ -132,11 +132,15 @@ on your back, when she rides).
 
 ### Hands
 
-His hands, and whatever they hold, follow your controllers. Link's model has no finger bones; it
-has a set of hand shapes, and an empty hand picks one from your fingers: open, a climbing hook, a
-fist, or a thumb-and-index pinch. With Index controllers the curl of each finger comes from
-SteamVR's finger tracking; on other controllers the trigger is the index finger and the grip the
-rest. A hand holding the sword or an item makes a fist; the shield hand grips the shield. The controller holds the item joint the game attaches weapons to, oriented so the
+His hands, and whatever they hold, follow your controllers. With finger tracking (Valve Index),
+each hand is built from your tracked skeleton: every bone of every finger, bare fingers and a
+leather glove over the palm and wrist, attached to the end of Link's arm and hidden by whatever is
+in front of it. Every finger bends, spreads and points like yours (Body > Finger Tracking Hands).
+
+Link's own model has no finger bones: each hand is one rigid joint with a few pre-posed shapes.
+Without finger tracking (or with the setting off) an empty hand picks the closest shape: open, a
+climbing hook, a fist, or a thumb-and-index pinch, with the trigger as the index finger and the
+grip the rest. A hand holding the sword or an item makes a fist; the shield hand grips the shield. The controller holds the item joint the game attaches weapons to, oriented so the
 blade points along the controller like a held sword. Everything held is moved to the controller's
 pose again at draw time, so hands track at the headset's refresh rate rather than the game's 30 Hz.
 If a weapon sits at an odd angle in your grip, the sword / shield pitch, yaw and roll offsets in

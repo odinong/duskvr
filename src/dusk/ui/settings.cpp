@@ -1800,6 +1800,12 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
                             "his legs animate; your head and arms stay yours. Climbing, swimming, "
                             "crawling and riding still play in full.",
             });
+        config_bool_select(leftPane, rightPane, vr.fingerHands,
+            {
+                .key = "Finger Tracking Hands",
+                .helpText = "With finger tracking (Valve Index), Link's hands are built from your "
+                            "tracked fingers: every finger bends, spreads and points like yours.",
+            });
         config_bool_select(leftPane, rightPane, vr.roomScale,
             {
                 .key = "Room Scale",

@@ -35,6 +35,10 @@ struct InputState {
     // tracking when the runtime offers it (Index controllers do), otherwise from trigger and grip.
     float curl[2][5]{};
     bool fingersTracked[2]{};
+    // The tracked hand skeleton (XR_EXT_hand_tracking's 26 joints, tracking space) when
+    // fingersTracked: palm, wrist, then thumb (4), index, middle, ring, little (5 each).
+    Pose joints[2][26];
+    float jointRadius[2][26]{};
 };
 
 bool initialize();

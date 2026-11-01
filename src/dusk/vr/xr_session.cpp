@@ -922,6 +922,13 @@ void read_fingers(InputState& in, XrTime time) {
         in.curl[h][2] = finger_curl(joints.data(), {11, 12, 13, 14, 15}, deg2rad(230.f));
         in.curl[h][3] = finger_curl(joints.data(), {16, 17, 18, 19, 20}, deg2rad(230.f));
         in.curl[h][4] = finger_curl(joints.data(), {21, 22, 23, 24, 25}, deg2rad(230.f));
+        for (int j = 0; j < XR_HAND_JOINT_COUNT_EXT; ++j) {
+            const auto& pose = joints[j].pose;
+            in.joints[h][j].position = {pose.position.x, pose.position.y, pose.position.z};
+            in.joints[h][j].orientation = {pose.orientation.x, pose.orientation.y,
+                pose.orientation.z, pose.orientation.w};
+            in.jointRadius[h][j] = joints[j].radius;
+        }
         in.fingersTracked[h] = true;
     }
 }

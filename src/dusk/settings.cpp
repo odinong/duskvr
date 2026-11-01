@@ -222,6 +222,7 @@ UserSettings g_userSettings = {
         .fullBody {"vr.fullBody", true},
         .stillIdle {"vr.stillIdle", true},
         .legsOnlyWalk {"vr.legsOnlyWalk", true},
+        .fingerHands {"vr.fingerHands", true},
         .comfortVignette {"vr.comfortVignette", false},
     },
 
@@ -468,6 +469,7 @@ void registerSettings() {
     Register(g_userSettings.vr.fullBody);
     Register(g_userSettings.vr.stillIdle);
     Register(g_userSettings.vr.legsOnlyWalk);
+    Register(g_userSettings.vr.fingerHands);
     Register(g_userSettings.vr.comfortVignette);
     Register(g_userSettings.backend.isoVerification);
     Register(g_userSettings.backend.graphicsBackend);

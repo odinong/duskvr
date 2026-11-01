@@ -33,7 +33,8 @@ puts you in the body instead of behind it:
   boomerang and Dominion Rod. Toss what you carry.
 - **Your body moves you.** Walk around your room, crouch for real, climb ladders and vines with
   your hands, swim with arm strokes, snap the reins to spur Epona.
-- **Fingers.** On Valve Index controllers your fingers open, curl and pinch Link's hands.
+- **Fingers.** On Valve Index controllers Link's hands are built from your tracked fingers: every
+  finger bends, spreads and points like yours.
 - **Wolf Link** in first person on all fours, clawing, biting with a lunge, digging with your hands.
 - **A HUD that floats.** Hearts, items, text and every menu (the game's and Dusklight's) live on a
   panel in front of you; point and click with a laser.
