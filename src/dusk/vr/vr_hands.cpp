@@ -1,5 +1,6 @@
 #include "dusk/vr/vr_hands.h"
 
+#include "dusk/vr/vr_stockhand.h"
 #include "dusk/vr/xr_session.h"
 
 #include <dolphin/gx.h>
@@ -110,9 +111,85 @@ void build_hand(const xr::InputState& in, int h, const Vec3& wristAnchor) {
     finger(22, 25);
 }
 
+
+void set_common_state(const Mtx view, const Mtx44 projection, const Mtx trackingToWorld) {
+    Mtx posMtx;
+    MTXConcat(view, trackingToWorld, posMtx);
+    GXSetProjection(projection, GX_PERSPECTIVE);
+    GXSetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
+    GXSetCullMode(GX_CULL_NONE);
+    GXSetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_SET);
+    GXSetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
+    GXSetFog(GX_FOG_NONE, 0.f, 0.f, 0.f, 0.f, GXColor{0, 0, 0, 0});
+    GXSetNumIndStages(0);
+    GXSetNumChans(1);
+    GXSetNumTevStages(1);
+    GXSetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHT_NULL, GX_DF_NONE,
+        GX_AF_NONE);
+    GXLoadPosMtxImm(posMtx, GX_PNMTX0);
+    GXSetCurrentMtx(GX_PNMTX0);
+}
+
+// Link's own open hands, skinned to the tracked fingers and drawn with their texture.
+bool draw_stock(const Frame& frame, const Mtx view, const Mtx44 projection,
+    const Mtx trackingToWorld) {
+    if (frame.handModel == nullptr || !stockhand::prepare(frame.handModel)) {
+        return false;
+    }
+    const auto& in = xr::input();
+    static std::vector<stockhand::SkinnedVertex> verts;
+    bool stateSet = false;
+    for (int h = 0; h < 2; ++h) {
+        if (!frame.show[h] || (!in.fingersTracked[h] && frame.testJoints == nullptr)) {
+            continue;
+        }
+        verts.clear();
+        stockhand::pose(h, frame.testJoints != nullptr ? frame.testJoints[h] : in.joints[h],
+            frame.wrist[h], frame.metersPerUnit, verts);
+        if (verts.empty()) {
+            continue;
+        }
+        if (!stateSet) {
+            set_common_state(view, projection, trackingToWorld);
+            GXSetNumTexGens(1);
+            GXSetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
+            GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
+            GXSetTevOp(GX_TEVSTAGE0, GX_MODULATE);
+            GXClearVtxDesc();
+            GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+            GXSetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+            GXSetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+            GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+            GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+            GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+            stateSet = true;
+        }
+        stockhand::load_texture(h);
+        GXBegin(GX_TRIANGLES, GX_VTXFMT0, static_cast<u16>(verts.size()));
+        for (const auto& v : verts) {
+            const GXColor lit = shade(GXColor{255, 255, 255, 255}, v.normal);
+            GXPosition3f32(v.pos.x, v.pos.y, v.pos.z);
+            GXColor4u8(lit.r, lit.g, lit.b, 255);
+            GXTexCoord2f32(v.u, v.v);
+        }
+        GXEnd();
+    }
+    if (stateSet) {
+        GXSetVtxDesc(GX_VA_TEX0, GX_NONE);
+        GXSetNumTexGens(0);
+        GXSetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
+        GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD_NULL, GX_TEXMAP_NULL, GX_COLOR0A0);
+        GXSetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
+    }
+    return true;
+}
+
 }  // namespace
 
 void draw(const Frame& frame, const Mtx view, const Mtx44 projection, const Mtx trackingToWorld) {
+    if (draw_stock(frame, view, projection, trackingToWorld)) {
+        return;
+    }
     const auto& in = xr::input();
     g_tris.clear();
     for (int h = 0; h < 2; ++h) {
@@ -124,24 +201,10 @@ void draw(const Frame& frame, const Mtx view, const Mtx44 projection, const Mtx 
         return;
     }
 
-    Mtx posMtx;
-    MTXConcat(view, trackingToWorld, posMtx);
-    GXSetProjection(projection, GX_PERSPECTIVE);
-    GXSetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
-    GXSetCullMode(GX_CULL_NONE);
-    GXSetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_SET);
-    GXSetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
-    GXSetFog(GX_FOG_NONE, 0.f, 0.f, 0.f, 0.f, GXColor{0, 0, 0, 0});
-    GXSetNumIndStages(0);
-    GXSetNumChans(1);
+    set_common_state(view, projection, trackingToWorld);
     GXSetNumTexGens(0);
-    GXSetNumTevStages(1);
     GXSetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
     GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD_NULL, GX_TEXMAP_NULL, GX_COLOR0A0);
-    GXSetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHT_NULL, GX_DF_NONE,
-        GX_AF_NONE);
-    GXLoadPosMtxImm(posMtx, GX_PNMTX0);
-    GXSetCurrentMtx(GX_PNMTX0);
     GXClearVtxDesc();
     GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
     GXSetVtxDesc(GX_VA_CLR0, GX_DIRECT);

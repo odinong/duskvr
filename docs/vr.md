@@ -133,9 +133,10 @@ on your back, when she rides).
 ### Hands
 
 His hands, and whatever they hold, follow your controllers. With finger tracking (Valve Index),
-each hand is built from your tracked skeleton: every bone of every finger, bare fingers and a
-leather glove over the palm and wrist, attached to the end of Link's arm and hidden by whatever is
-in front of it. Every finger bends, spreads and points like yours (Body > Finger Tracking Hands).
+Link's own open hand is skinned to your tracked skeleton: the mesh is rigged to a finger skeleton
+measured from it, and every frame each finger bone turns like yours while keeping Link's
+proportions and texture. Every finger bends, spreads and points like yours (Body > Finger Tracking
+Hands).
 
 Link's own model has no finger bones: each hand is one rigid joint with a few pre-posed shapes.
 Without finger tracking (or with the setting off) an empty hand picks the closest shape: open, a

@@ -9,6 +9,7 @@
 #include "dusk/vr/vr_gamepad.h"
 #include "dusk/vr/vr_input.h"
 #include "dusk/vr/vr_hands.h"
+#include "dusk/vr/vr_stockhand.h"
 #include "dusk/vr/vr_wheel.h"
 #include "dusk/vr/xr_session.h"
 
@@ -954,6 +955,9 @@ void after_sim_tick() {
             dump_skeleton(link->mpLinkModel, link->checkWolf() ? "wolf" : "human");
             if (!link->checkWolf() && link->mpLinkHandModel != nullptr) {
                 J3DModelData* hands = link->mpLinkHandModel->getModelData();
+                if (const char* dir = std::getenv("DUSK_VR_DUMP_HAND_OBJ"); dir != nullptr) {
+                    stockhand::dump_obj(hands, dir);
+                }
                 for (u16 i = 0; i < hands->getMaterialNum(); ++i) {
                     Log.info("hand material {} '{}' joint {}", i,
                         hands->getMaterialName() ? hands->getMaterialName()->getName(i) : "?",
@@ -1226,6 +1230,10 @@ void draw_eye_overlays() {
     }
     hands::Frame fingers;
     daAlink_c* link = get_link();
+    if (link != nullptr && link->mpLinkHandModel != nullptr) {
+        fingers.handModel = link->mpLinkHandModel->getModelData();
+    }
+    fingers.metersPerUnit = 1.f / units_per_meter();
     const auto& in = xr::input();
     for (const xr::Hand hand : {xr::kLeft, xr::kRight}) {
         fingers.show[hand] = finger_hand_shown(link, hand);
@@ -1240,11 +1248,19 @@ void draw_eye_overlays() {
     }
     if (std::getenv("DUSK_VR_TEST_HANDS") != nullptr) {
         // Debug aid: shows each tracked hand in front of the headset.
+        static Pose testJoints[2][26];
+        const float curl = 0.6f * (0.5f - 0.5f * std::cos(xr::predicted_display_seconds() * 1.5));
+        const Pose& head = xr::head();
         for (const xr::Hand hand : {xr::kLeft, xr::kRight}) {
-            fingers.show[hand] = in.fingersTracked[hand];
-            fingers.wrist[hand] = xr::head().position + xr::head().forward() * 0.35f +
-                                  xr::head().right() * (hand == xr::kLeft ? -0.1f : 0.1f);
+            fingers.show[hand] = true;
+            fingers.wrist[hand] = head.position + head.forward() * 0.3f +
+                                  head.right() * (hand == xr::kLeft ? -0.12f : 0.02f) -
+                                  head.up() * 0.05f;
+            // Fingers pointing right and up-ish, palm toward the viewer.
+            stockhand::synth_joints(hand, head.orientation * Quat::yaw(kPi * 0.5f), curl,
+                testJoints[hand]);
         }
+        fingers.testJoints = testJoints;
     }
     hands::draw(fingers, view->viewMtx, view->projMtx, g_eyeTrackingToWorld);
     wheel::draw(view->viewMtx, view->projMtx, g_eyeTrackingToWorld);
@@ -1443,12 +1459,24 @@ bool body_animated(daAlink_c* link) {
 // the animation. Returns whether the pose changed.
 bool steady_body(daAlink_c* link, J3DModel* model) {
     const auto& vr = getSettings().vr;
-    if (body_animated(link)) {
+    const bool animated = body_animated(link);
+    const bool still = std::fabs(link->speedF) < 0.5f && link->mLinkAcch.ChkGroundHit();
+    const bool idle = !animated && vr.stillIdle.getValue() && still;
+    const bool walk = !animated && vr.legsOnlyWalk.getValue() && !idle;
+    {
+        // Logged on change, to see what Link was doing when the body pose misbehaves.
+        static int lastProc = -1, lastMode = -1;
+        const int mode = animated ? 0 : idle ? 2 : walk ? 1 : 3;
+        if (link->mProcID != lastProc || mode != lastMode) {
+            lastProc = link->mProcID;
+            lastMode = mode;
+            static constexpr const char* kModes[] = {"animated", "legs only", "still", "off"};
+            Log.debug("body: proc {:#x} speed {:.1f} -> {}", lastProc, link->speedF, kModes[mode]);
+        }
+    }
+    if (animated) {
         return false;
     }
-    const bool still = std::fabs(link->speedF) < 0.5f && link->mLinkAcch.ChkGroundHit();
-    const bool idle = vr.stillIdle.getValue() && still;
-    const bool walk = vr.legsOnlyWalk.getValue() && !idle;
     if (!idle && !walk) {
         return false;
     }
@@ -1632,6 +1660,15 @@ void restore_item_joints(daAlink_c* link) {
 
 void override_link_hands(daAlink_c* link) {
     J3DModel* model = link->mpLinkModel;
+    {
+        static int last = -1;
+        const int now = first_person() ? 1 : 0;
+        if (now != last) {
+            last = now;
+            Log.debug("body: first person {} (controllable {}, view mode {})", now, g_controllable,
+                getSettings().vr.viewMode.getValue());
+        }
+    }
     if (!first_person() || model == nullptr || !g_linkValid) {
         restore_item_joints(link);
         g_placements[xr::kLeft].valid = g_placements[xr::kRight].valid = false;
