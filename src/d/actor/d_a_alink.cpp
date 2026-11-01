@@ -56,6 +56,7 @@
 #include "dusk/interp/frame_interpolation.h"
 #include "dusk/interp/sight.h"
 #include "dusk/settings.h"
+#include "dusk/vr/vr.h"
 #include "res/Object/Alink.h"
 #include <cstring>
 #include <helpers/string.hpp>
@@ -9469,7 +9470,9 @@ void daAlink_c::setStickData() {
         }
 
         mMoveValue = mStickValue;
-        mMoveAngle = mStickAngle + dCam_getControledAngleY(dComIfGp_getCamera(field_0x317c));
+        mMoveAngle = mStickAngle + DUSK_IF_ELSE(
+            dusk::vr::control_angle_y(dCam_getControledAngleY(dComIfGp_getCamera(field_0x317c))),
+            dCam_getControledAngleY(dComIfGp_getCamera(field_0x317c)));
 
         if (checkMagneBootsOn()) {
             if (field_0x2fb9 == 1 ||
@@ -18590,6 +18593,10 @@ int daAlink_c::execute() {
                 if (checkShieldGet() && !checkWoodShieldEquip()) {
                     stickArrowIncrement(1);
                 }
+#if TARGET_PC
+                // VR: put Link's hands (and what they hold) where the controllers are.
+                dusk::vr::override_link_hands(this);
+#endif
                 setItemMatrix(0);
             } else {
                 daMidna_c* pmidna = (daMidna_c*)getMidnaActor();
@@ -19611,7 +19618,7 @@ int daAlink_c::draw() {
 
     if (checkWolf()) {
         dComIfGd_setListDark();
-        modelDraw(mpLinkModel, isPlayerNoDraw);
+        modelDraw(mpLinkModel, isPlayerNoDraw IF_DUSK(|| dusk::vr::hide_link_body()));
 
         if (dComIfGs_isEventBit(dSv_event_flag_c::M_011)) {
             for (int i = 0; i < 4; i++) {
@@ -19671,7 +19678,7 @@ int daAlink_c::draw() {
             }
         }
 
-        modelDraw(mpLinkModel, isPlayerNoDraw);
+        modelDraw(mpLinkModel, isPlayerNoDraw IF_DUSK(|| dusk::vr::hide_link_body()));
 
         if (dComIfGp_checkCameraAttentionStatus(field_0x317c, 0x20)) {
 #if PLATFORM_SHIELD
@@ -19719,14 +19726,16 @@ int daAlink_c::draw() {
         }
 
         BOOL var_r3 = isPlayerNoDraw || dComIfGp_checkCameraAttentionStatus(field_0x317c, 0x20);
+        // VR first person: no head (it would fill the view) and no sheath on the hidden back.
+        BOOL headNoDraw = var_r3 IF_DUSK(|| dusk::vr::hide_link_body());
 
-        modelDraw(mpLinkHatModel, var_r3);
+        modelDraw(mpLinkHatModel, headNoDraw);
 
         if (checkNoResetFlg1(FLG1_UNK_10)) {
-            modelDraw(mpDemoFCBlendModel, var_r3);
-            modelDraw(mpDemoFCTongueModel, var_r3);
+            modelDraw(mpDemoFCBlendModel, headNoDraw);
+            modelDraw(mpDemoFCTongueModel, headNoDraw);
         } else {
-            modelDraw(mpLinkFaceModel, var_r3);
+            modelDraw(mpLinkFaceModel, headNoDraw);
         }
 
         tevStr.TevKColor.r = 0;
@@ -19739,7 +19748,7 @@ int daAlink_c::draw() {
             }
 
             if (!checkWoodSwordEquip()) {
-                modelDraw(mSheathModel, var_r3);
+                modelDraw(mSheathModel, headNoDraw);
             }
         }
 

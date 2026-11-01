@@ -188,6 +188,27 @@ UserSettings g_userSettings = {
         .enableAdvancedSettings {"backend.enableAdvancedSettings", false},
     },
 
+    .vr = {
+        .enabled {"vr.enabled", true},
+        .viewMode {"vr.viewMode", 0},
+        .worldScale {"vr.worldScale", 100.0f},
+        .heightOffset {"vr.heightOffset", 0.0f},
+        .turnMode {"vr.turnMode", 0},
+        .snapTurnDegrees {"vr.snapTurnDegrees", 45},
+        .smoothTurnSpeed {"vr.smoothTurnSpeed", 120.0f},
+        .handOrientedMovement {"vr.handOrientedMovement", false},
+        .leftHanded {"vr.leftHanded", false},
+        .motionControls {"vr.motionControls", true},
+        .swingSpeed {"vr.swingSpeed", 2.2f},
+        .physicalCrouch {"vr.physicalCrouch", true},
+        .roomScale {"vr.roomScale", true},
+        .levelHorizon {"vr.levelHorizon", true},
+        .resolutionScale {"vr.resolutionScale", 1.0f},
+        .handOffsetPitch {"vr.handOffsetPitch", 0.0f},
+        .handOffsetYaw {"vr.handOffsetYaw", 0.0f},
+        .handOffsetRoll {"vr.handOffsetRoll", 0.0f},
+    },
+
     // Not sure if there's a better way to declare this
     .actionBindings = {
         .firstPersonCamera {
@@ -398,6 +419,24 @@ void registerSettings() {
     Register(g_userSettings.game.swapDirectSelect);
 
     Register(g_userSettings.backend.isoPath);
+    Register(g_userSettings.vr.enabled);
+    Register(g_userSettings.vr.viewMode);
+    Register(g_userSettings.vr.worldScale);
+    Register(g_userSettings.vr.heightOffset);
+    Register(g_userSettings.vr.turnMode);
+    Register(g_userSettings.vr.snapTurnDegrees);
+    Register(g_userSettings.vr.smoothTurnSpeed);
+    Register(g_userSettings.vr.handOrientedMovement);
+    Register(g_userSettings.vr.leftHanded);
+    Register(g_userSettings.vr.motionControls);
+    Register(g_userSettings.vr.swingSpeed);
+    Register(g_userSettings.vr.physicalCrouch);
+    Register(g_userSettings.vr.roomScale);
+    Register(g_userSettings.vr.levelHorizon);
+    Register(g_userSettings.vr.resolutionScale);
+    Register(g_userSettings.vr.handOffsetPitch);
+    Register(g_userSettings.vr.handOffsetYaw);
+    Register(g_userSettings.vr.handOffsetRoll);
     Register(g_userSettings.backend.isoVerification);
     Register(g_userSettings.backend.graphicsBackend);
     Register(g_userSettings.backend.skipPreLaunchUI);

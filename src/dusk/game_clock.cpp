@@ -1,4 +1,5 @@
 #include "dusk/game_clock.h"
+#include "dusk/vr/vr.h"
 
 #include <aurora/time.hpp>
 
@@ -86,7 +87,8 @@ const FrameTiming& advance() {
 
     const float timeScale = aurora::time::scale();
     const bool interpolating =
-        getSettings().game.enableFrameInterpolation.getValue() != FrameInterpMode::Off;
+        getSettings().game.enableFrameInterpolation.getValue() != FrameInterpMode::Off ||
+        vr::active();
     const bool separatePresentation = interpolating || timeScale != 1.0f;
     out.interpolating = interpolating;
     out.separatePresentation = separatePresentation;

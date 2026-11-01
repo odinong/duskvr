@@ -193,6 +193,20 @@ FetchContent_Declare(picosha2
 
 set(_fetch_content_deps miniz picosha2)
 
+option(DUSK_ENABLE_VR "Enable OpenXR VR support" ${WIN32})
+if (DUSK_ENABLE_VR)
+    message(STATUS "dusklight: Fetching OpenXR-SDK")
+    set(DYNAMIC_LOADER OFF CACHE BOOL "" FORCE)
+    set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(BUILD_API_LAYERS OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(openxr
+        URL https://github.com/KhronosGroup/OpenXR-SDK/archive/refs/tags/release-1.1.62.tar.gz
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        EXCLUDE_FROM_ALL
+    )
+    list(APPEND _fetch_content_deps openxr)
+endif ()
+
 if (DUSK_ENABLE_OPUS)
     message(STATUS "dusklight: Fetching opusfile")
 
@@ -290,6 +304,14 @@ endif ()
 
 if (WIN32)
     list(APPEND GAME_LIBS Ws2_32)
+endif ()
+
+if (DUSK_ENABLE_VR)
+    list(APPEND GAME_LIBS openxr_loader)
+    list(APPEND GAME_COMPILE_DEFS DUSK_VR=1)
+    if (WIN32)
+        list(APPEND GAME_LIBS d3d12 dxgi)
+    endif ()
 endif ()
 
 if (DUSK_ENABLE_CODE_MODS)

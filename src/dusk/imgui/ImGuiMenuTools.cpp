@@ -11,6 +11,7 @@
 #include "dusk/os.h"
 #include "dusk/settings.h"
 #include "dusk/speedrun.h"
+#include "dusk/vr/vr.h"
 
 #include "d/actor/d_a_alink.h"
 #include "d/actor/d_a_horse.h"
@@ -46,6 +47,8 @@ namespace dusk {
             if (!dusk::IsGameLaunched) {
                 ImGui::EndDisabled();
             }
+
+            ImGui::MenuItem("VR", nullptr, &m_showVrWindow);
 
 #if DUSK_CAN_OPEN_DATA_FOLDER
             ImGui::Separator();
@@ -133,6 +136,12 @@ namespace dusk {
             ImGui::EndDisabled();
 
             ImGui::EndMenu();
+        }
+    }
+
+    void ImGuiMenuTools::ShowVrWindow() {
+        if (m_showVrWindow) {
+            vr::draw_imgui_window(&m_showVrWindow);
         }
     }
 

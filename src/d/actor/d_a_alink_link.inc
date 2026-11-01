@@ -192,6 +192,15 @@ BOOL daAlink_c::setBodyAngleToCamera() {
                 }
             }
         }
+
+        // VR: aim where the controller points.
+        if (checkAimInputContext()) {
+            s16 handYaw, handPitch;
+            if (dusk::vr::hand_aim(handYaw, handPitch)) {
+                shape_angle.y = handYaw;
+                sp8 = handPitch;
+            }
+        }
 #endif
 
         if (checkNotItemSinkLimit() && sp8 > 0) {

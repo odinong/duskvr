@@ -1442,6 +1442,13 @@ set(DUSK_FILES
         src/dusk/gamepad_color.cpp
         src/dusk/globals.cpp
         src/dusk/gyro.cpp
+        src/dusk/vr/vr.cpp
+        src/dusk/vr/vr.h
+        src/dusk/vr/vr_math.h
+        src/dusk/vr/xr_session.cpp
+        src/dusk/vr/xr_session.h
+        src/dusk/vr/vr_input.cpp
+        src/dusk/vr/vr_input.h
         src/dusk/game_combos.cpp
         src/dusk/trigger_viewer.cpp
         #src/dusk/m_Do_ext_dusk.cpp

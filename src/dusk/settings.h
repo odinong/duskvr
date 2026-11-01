@@ -349,6 +349,28 @@ struct UserSettings {
         ConfigVar<bool> enableAdvancedSettings;
     } backend;
 
+    struct {
+        // VR (OpenXR)
+        ConfigVar<bool> enabled;
+        ConfigVar<int> viewMode;          // 0 = first person, 1 = third person
+        ConfigVar<float> worldScale;      // game units per real-world meter
+        ConfigVar<float> heightOffset;    // extra eye height, in game units
+        ConfigVar<int> turnMode;          // 0 = snap, 1 = smooth, 2 = none
+        ConfigVar<int> snapTurnDegrees;
+        ConfigVar<float> smoothTurnSpeed; // degrees per second
+        ConfigVar<bool> handOrientedMovement;
+        ConfigVar<bool> leftHanded;       // sword in the left controller
+        ConfigVar<bool> motionControls;
+        ConfigVar<float> swingSpeed;      // m/s of the sword tip needed to swing
+        ConfigVar<bool> physicalCrouch;
+        ConfigVar<bool> roomScale;
+        ConfigVar<bool> levelHorizon;     // third person / cutscenes: drop camera pitch and roll
+        ConfigVar<float> resolutionScale;
+        ConfigVar<float> handOffsetPitch; // degrees, controller grip -> Link's hand bone
+        ConfigVar<float> handOffsetYaw;
+        ConfigVar<float> handOffsetRoll;
+    } vr;
+
     // Arrays of size 4 for 4 ports
     struct {
         std::array<ActionBindConfigVar, 4> firstPersonCamera;

@@ -1,0 +1,251 @@
+diff --git a/cmake/aurora_core.cmake b/cmake/aurora_core.cmake
+index dfeed19..277adf8 100644
+--- a/cmake/aurora_core.cmake
++++ b/cmake/aurora_core.cmake
+@@ -47,7 +47,7 @@ if (IOS)
+ endif ()
+ 
+ if (AURORA_ENABLE_GX)
+-    target_sources(aurora_core PRIVATE lib/imgui.cpp)
++    target_sources(aurora_core PRIVATE lib/imgui.cpp lib/xr.cpp)
+     target_link_libraries(aurora_core PUBLIC imgui)
+ endif ()
+ 
+diff --git a/include/aurora/xr.hpp b/include/aurora/xr.hpp
+new file mode 100644
+index 0000000..084ff3e
+--- /dev/null
++++ b/include/aurora/xr.hpp
+@@ -0,0 +1,47 @@
++#pragma once
++
++#include <webgpu/webgpu_cpp.h>
++
++#include <cstdint>
++#include <functional>
++#include <vector>
++
++// Hooks for stereo / XR presentation. All setters must be called on the game thread.
++namespace aurora::xr {
++
++struct PresentSource {
++  wgpu::Texture texture;
++  wgpu::TextureView view;
++  wgpu::TextureFormat format;
++  uint32_t width;
++  uint32_t height;
++};
++
++using AfterSubmitCallback = std::function<void()>;
++
++// Runs on the render worker while the frame encoder is open, before the window present pass.
++// Record work on `encoder` (leave no pass open). Callbacks appended to `afterSubmit` run once the
++// frame's command buffer has been submitted to the queue.
++using FrameHook = std::function<void(wgpu::CommandEncoder& encoder, const PresentSource& source,
++                                     std::vector<AfterSubmitCallback>& afterSubmit)>;
++
++// Installs a hook for the next aurora_end_frame only.
++void set_next_frame_hook(FrameHook hook);
++
++// Whether the next aurora_end_frame presents to the window surface (default true). Resets after
++// every frame.
++void set_next_frame_window_present(bool enabled);
++
++// Overrides the content framebuffer (EFB) size, independent of the window. 0x0 clears the
++// override. Takes effect on the next swapchain refresh.
++void set_framebuffer_override(uint32_t width, uint32_t height);
++bool framebuffer_override(uint32_t& width, uint32_t& height);
++
++// Blocks until the render worker has drained and submitted all queued frames.
++void synchronize();
++
++wgpu::Device device();
++wgpu::Queue queue();
++wgpu::BackendType backend_type();
++
++} // namespace aurora::xr
+diff --git a/lib/aurora.cpp b/lib/aurora.cpp
+index 9430842..2ce4c1f 100644
+--- a/lib/aurora.cpp
++++ b/lib/aurora.cpp
+@@ -25,6 +25,8 @@
+ #include "thread.hpp"
+ #include "window.hpp"
+ 
++#include <aurora/xr.hpp>
++
+ #include <SDL3/SDL_filesystem.h>
+ #include <magic_enum.hpp>
+ 
+@@ -32,6 +34,11 @@
+ #include "tracy/Tracy.hpp"
+ 
+ namespace aurora {
++namespace xr::detail {
++FrameHook take_frame_hook();
++bool take_window_present();
++} // namespace xr::detail
++
+ AuroraConfig g_config;
+ uint32_t g_sdlCustomEventsStart;
+ char g_gameName[4];
+@@ -286,14 +293,26 @@ void end_frame() noexcept {
+ #endif
+ 
+   gfx::end_frame([rmlBindGroup = std::move(rmlBindGroup), rmlOverlay, viewport,
+-                  imguiDrawData = std::move(imguiDrawData)](
++                  imguiDrawData = std::move(imguiDrawData), xrHook = xr::detail::take_frame_hook(),
++                  windowPresent = xr::detail::take_window_present()](
+                      wgpu::CommandEncoder& encoder, std::vector<gfx::AfterSubmitCallback> afterSubmitCallbacks) {
++    if (xrHook) {
++      const auto& source = webgpu::present_source();
++      const xr::PresentSource xrSource{
++          .texture = source.texture,
++          .view = source.view,
++          .format = source.format,
++          .width = source.size.width,
++          .height = source.size.height,
++      };
++      xrHook(encoder, xrSource, afterSubmitCallbacks);
++    }
+     wgpu::Texture currentTexture;
+     wgpu::TextureView currentView;
+     auto surfaceStatus = wgpu::SurfaceGetCurrentTextureStatus::Error;
+     {
+       window::SurfaceLock surfaceLock;
+-      if (window::is_presentable() && g_surface) {
++      if (windowPresent && window::is_presentable() && g_surface) {
+         ZoneScopedN("Acquire texture");
+         wgpu::SurfaceTexture surfaceTexture;
+         g_surface.GetCurrentTexture(&surfaceTexture);
+@@ -363,7 +382,7 @@ void end_frame() noexcept {
+         imgui::render(pass, imguiDrawData);
+         pass.End();
+       }
+-    } else {
++    } else if (windowPresent) {
+       Log.info("Skipping present; window not presentable");
+     }
+     webgpu::gpu_prof::frame_end(encoder);
+@@ -389,7 +408,7 @@ void end_frame() noexcept {
+         Log.warn("Surface present failed");
+         webgpu::release_surface();
+       }
+-    } else if (g_surface) {
++    } else if (g_surface && windowPresent) {
+       switch (surfaceStatus) {
+       case wgpu::SurfaceGetCurrentTextureStatus::Timeout:
+         Log.warn("Surface texture acquisition timed out");
+diff --git a/lib/webgpu/gpu.cpp b/lib/webgpu/gpu.cpp
+index b3ae6cd..0a0ff03 100644
+--- a/lib/webgpu/gpu.cpp
++++ b/lib/webgpu/gpu.cpp
+@@ -949,6 +949,13 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
+       if (feature == wgpu::FeatureName::TimestampQuery) {
+         requiredFeatures.push_back(feature);
+       }
++#endif
++#ifdef _WIN32
++      // Lets OpenXR swapchain images be imported as WebGPU textures.
++      if (feature == wgpu::FeatureName::SharedTextureMemoryD3D12Resource ||
++          feature == wgpu::FeatureName::SharedFenceDXGISharedHandle) {
++        requiredFeatures.push_back(feature);
++      }
+ #endif
+     }
+     std::string featureList;
+diff --git a/lib/window.cpp b/lib/window.cpp
+index 2a4aadf..4e80cc4 100644
+--- a/lib/window.cpp
++++ b/lib/window.cpp
+@@ -1,5 +1,7 @@
+ #include "window.hpp"
+ 
++#include <aurora/xr.hpp>
++
+ #ifdef AURORA_ENABLE_GX
+ #include "imgui.hpp"
+ #include "webgpu/gpu.hpp"
+@@ -472,6 +474,11 @@ AuroraWindowSize get_window_size() {
+     }
+   }
+ 
++  if (uint32_t overrideW = 0, overrideH = 0; xr::framebuffer_override(overrideW, overrideH)) {
++    fb_w = static_cast<int>(overrideW);
++    fb_h = static_cast<int>(overrideH);
++  }
++
+   const float scale = SDL_GetWindowDisplayScale(g_window);
+   return {
+       .width = static_cast<uint32_t>(width),
+@@ -591,6 +598,34 @@ void set_background_input(bool value) { SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACK
+ 
+ } // namespace aurora::window
+ 
++namespace aurora::xr {
++namespace {
++uint32_t g_overrideWidth = 0;
++uint32_t g_overrideHeight = 0;
++} // namespace
++
++void set_framebuffer_override(uint32_t width, uint32_t height) {
++  if (width == 0 || height == 0) {
++    width = height = 0;
++  }
++  if (width == g_overrideWidth && height == g_overrideHeight) {
++    return;
++  }
++  g_overrideWidth = width;
++  g_overrideHeight = height;
++  window::request_frame_buffer_resize();
++}
++
++bool framebuffer_override(uint32_t& width, uint32_t& height) {
++  if (g_overrideWidth == 0 || g_overrideHeight == 0) {
++    return false;
++  }
++  width = g_overrideWidth;
++  height = g_overrideHeight;
++  return true;
++}
++} // namespace aurora::xr
++
+ #if defined(SDL_PLATFORM_ANDROID)
+ extern "C" JNIEXPORT void JNICALL Java_dev_encounter_aurora_AuroraSurface_nativeSetSurfaceReady(JNIEnv*, jclass,
+                                                                                                 jboolean ready) {
+diff --git a/lib/xr.cpp b/lib/xr.cpp
+new file mode 100644
+index 0000000..aafeebe
+--- /dev/null
++++ b/lib/xr.cpp
+@@ -0,0 +1,30 @@
++#include "aurora/xr.hpp"
++
++#include "gfx/frame.hpp"
++#include "internal.hpp"
++#include "webgpu/gpu.hpp"
++
++namespace aurora::xr {
++namespace {
++FrameHook g_nextFrameHook;
++bool g_nextFrameWindowPresent = true;
++} // namespace
++
++namespace detail {
++FrameHook take_frame_hook() { return std::exchange(g_nextFrameHook, {}); }
++bool take_window_present() { return std::exchange(g_nextFrameWindowPresent, true); }
++} // namespace detail
++
++void set_next_frame_hook(FrameHook hook) { g_nextFrameHook = std::move(hook); }
++
++void set_next_frame_window_present(bool enabled) { g_nextFrameWindowPresent = enabled; }
++
++void synchronize() { gfx::gpu_synchronize(); }
++
++wgpu::Device device() { return webgpu::g_device; }
++
++wgpu::Queue queue() { return webgpu::g_queue; }
++
++wgpu::BackendType backend_type() { return webgpu::g_backendType; }
++
++} // namespace aurora::xr

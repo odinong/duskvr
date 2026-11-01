@@ -3,6 +3,7 @@
 #include "dusk/game_clock.h"
 #include "dusk/interp/frame_interpolation.h"
 #include "dusk/interp/lerp.h"
+#include "dusk/vr/vr.h"
 
 #include "d/d_com_inf_game.h"
 #include "f_op/f_op_camera_mng.h"
@@ -205,6 +206,7 @@ bool camera_apply_presentation() {
     std::memcpy(&s_presentationViewBackup, view, sizeof(view_class));
     interp_view(view);
     apply_presented_view(view);
+    dusk::vr::apply_eye_view(view, get_interpolation_step());
     return true;
 }
 

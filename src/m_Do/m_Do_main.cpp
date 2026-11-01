@@ -65,6 +65,7 @@
 #include "dusk/time.h"
 #include "dusk/ui/command_console.hpp"
 #include "dusk/ui/menu_bar.hpp"
+#include "dusk/vr/vr.h"
 #include "dusk/ui/overlay.hpp"
 #include "dusk/ui/prelaunch.hpp"
 #include "dusk/ui/preset.hpp"
@@ -187,6 +188,65 @@ bool launchUILoop() {
     return dusk::IsRunning;
 }
 
+static void run_sim_ticks(const dusk::game_clock::FrameTiming& timing) {
+    if (timing.numSimTicks <= 0) {
+        return;
+    }
+    dusk::interp::begin_frame(0.0f);
+    for (int i = 0; i < timing.numSimTicks; ++i) {
+        // When a capture is pending, it has to be painted before the next sim tick.
+        if (dMw_isCapturePending()) {
+            break;
+        }
+        if (timing.interpolating) {
+            dusk::interp::begin_sim_tick();
+        }
+        dusk::game_clock::begin_sim_tick();
+        dusk::vr::before_sim_tick();
+        mDoCPd_c::read();
+        dusk::mouse::read();
+        dusk::gyro::read(dusk::game_clock::kSimPeriod);
+        dusk::processGameCombos();
+        fapGm_Execute();
+        dusk::processCameraCommands();
+        mDoAud_Execute();
+        dusk::game_clock::commit_sim_tick();
+        dusk::vr::after_sim_tick();
+    }
+}
+
+// One headset frame: simulate once, then present the scene once per eye. Each presentation is a
+// full aurora frame whose output is copied into that eye's swapchain image.
+static void run_vr_frame() {
+    const int eyes = dusk::vr::eye_count();
+    const int passes = eyes > 0 ? eyes : 1;
+    float step = 1.0f;
+    for (int pass = 0; pass < passes; ++pass) {
+        if (!aurora_begin_frame()) {
+            break;
+        }
+        if (pass == 0) {
+            VIWaitForRetrace();
+            dusk::lastFrameAuroraStats = *aurora_get_stats();
+            mDoGph_gInf_c::updateRenderSize();
+            dusk::ui::update();
+
+            const auto timing = dusk::game_clock::advance();
+            run_sim_ticks(timing);
+            step = timing.interpolating ? dusk::game_clock::sample_interpolation_step() : 1.0f;
+        }
+        if (eyes > 0) {
+            dusk::vr::begin_eye(pass);
+        }
+        dusk::interp::begin_presentation(step);
+        fpcM_DrawIterater((fpcM_DrawIteraterFunc)fpcM_Draw);
+        cAPIGph_Painter();
+        dusk::interp::end_presentation();
+        aurora_end_frame();
+    }
+    dusk::vr::end_frame();
+}
+
 void main01(void) {
     OS_REPORT("\x1b[m");
 
@@ -272,6 +332,16 @@ void main01(void) {
 
         eventsDone:;
 
+        if (dusk::vr::begin_frame()) {
+            run_vr_frame();
+            FrameMark;
+#if BOREALIS_HAS_DISCORD
+            dusk::discord::run_callbacks();
+            dusk::discord::update_presence();
+#endif
+            continue;
+        }
+
         if (!aurora_begin_frame()) {
             DuskLog.debug("aurora_begin_frame returned false, skipping draw this frame");
             continue;
@@ -286,27 +356,7 @@ void main01(void) {
 
         const auto timing = dusk::game_clock::advance();
         if (timing.separatePresentation) {
-            if (timing.numSimTicks > 0) {
-                dusk::interp::begin_frame(0.0f);
-                for (int i = 0; i < timing.numSimTicks; ++i) {
-                    // When a capture is pending, it has to be painted before the next sim tick.
-                    if (dMw_isCapturePending()) {
-                        break;
-                    }
-                    if (timing.interpolating) {
-                        dusk::interp::begin_sim_tick();
-                    }
-                    dusk::game_clock::begin_sim_tick();
-                    mDoCPd_c::read();
-                    dusk::mouse::read();
-                    dusk::gyro::read(dusk::game_clock::kSimPeriod);
-                    dusk::processGameCombos();
-                    fapGm_Execute();
-                    dusk::processCameraCommands();
-                    mDoAud_Execute();
-                    dusk::game_clock::commit_sim_tick();
-                }
-            }
+            run_sim_ticks(timing);
 
             const float step = timing.interpolating ? dusk::game_clock::sample_interpolation_step() : 1.0f;
             dusk::interp::begin_presentation(step);
@@ -318,6 +368,7 @@ void main01(void) {
             dusk::game_clock::begin_sim_tick();
 
             // Game Inputs
+            dusk::vr::before_sim_tick();
             mDoCPd_c::read();
             dusk::mouse::read();
             dusk::gyro::read(timing.dt);
@@ -330,6 +381,7 @@ void main01(void) {
 
             mDoAud_Execute();
             dusk::game_clock::commit_sim_tick();
+            dusk::vr::after_sim_tick();
         }
 
         aurora_end_frame();
@@ -408,6 +460,17 @@ static AuroraBackend ResolveDesiredBackend(const cxxopts::ParseResult& parsedArg
                      dusk::backend_name(desiredBackend));
         desiredBackend = BACKEND_AUTO;
     }
+
+#if DUSK_VR && defined(_WIN32)
+    // OpenXR shares swapchains with the game through D3D12.
+    if (dusk::getSettings().vr.enabled && parsedArgOptions.count("backend") == 0 &&
+        desiredBackend != BACKEND_D3D12 && IsBackendAvailable(BACKEND_D3D12))
+    {
+        DuskLog.info("VR enabled: using the D3D12 backend instead of '{}'",
+                     dusk::backend_name(desiredBackend));
+        desiredBackend = BACKEND_D3D12;
+    }
+#endif
 
     return desiredBackend;
 }
@@ -958,9 +1021,12 @@ int game_main(int argc, char* argv[]) {
         dusk::ui::push_document(std::make_unique<dusk::ui::PresetWindow>());
     }
 
+    dusk::vr::initialize();
+
     OSReport("Starting main01 (Game Loop)...\n");
 
     main01();
+    dusk::vr::shutdown();
     borealis::shutdown();
 
     // We need to cleanly shut down the threads to avoid crashes on shutdown.
