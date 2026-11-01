@@ -124,6 +124,15 @@ bool g_climbing = false;
 bool g_swimming = false;
 bool g_riding = false;
 bool g_bodyTurning = false;
+bool g_stepping = false;
+
+// You can lean and look around this far (meters) before Link's feet step to stay under you.
+constexpr float kLeanRadius = 0.3f;
+
+// Link's eye position before the head was posed to the headset. The camera anchors on this, not on
+// the posed head, or the head would chase the camera that follows it.
+cXyz g_preIkEye;
+bool g_preIkEyeValid = false;
 
 double g_lastDisplayTime = 0.0;
 bool g_firstPersonFrame = false;
@@ -563,7 +572,7 @@ void before_sim_tick() {
         if (!g_locked && link->mLinkAcch.ChkGroundHit()) {
             const Vec3 fwd = Quat::yaw(g_yawOffset).rotate(xr::head().forward());
             const s16 diff = static_cast<s16>(game_yaw(fwd) - link->shape_angle.y);
-            if (std::abs(diff) > 0x2000) {
+            if (std::abs(diff) > 0x2AAA) {
                 g_bodyTurning = true;
             } else if (std::abs(diff) < 0x0400) {
                 g_bodyTurning = false;
@@ -593,14 +602,23 @@ void before_sim_tick() {
         }
         return;
     }
-    if (offset.lengthXZ() < 0.01f) {
+    // Lean and look around freely: the feet stay planted (the spine bends to follow your head)
+    // until your head is more than kLeanRadius from them, then Link steps to catch up.
+    const float dist = offset.lengthXZ();
+    if (dist > kLeanRadius) {
+        g_stepping = true;
+    } else if (dist < 0.04f) {
+        g_stepping = false;
+    }
+    if (!g_stepping) {
         return;
     }
-    const Vec3 world = Quat::yaw(g_yawOffset).rotate(offset) * units_per_meter();
+    const Vec3 step = offset * 0.35f;
+    const Vec3 world = Quat::yaw(g_yawOffset).rotate(step) * units_per_meter();
     link->current.pos.x += world.x;
     link->current.pos.z += world.z;
-    g_body.x = head.x;
-    g_body.z = head.z;
+    g_body.x += step.x;
+    g_body.z += step.z;
 }
 
 // Debug aid: DUSK_VR_DUMP_JOINTS=1 logs Link's skeleton (index, name, parent, rest position) once
@@ -700,11 +718,13 @@ void after_sim_tick() {
     }
     const daPy_py_c* player = link;
     g_locked = player->checkAttentionLock() || player->checkEnemyAttentionLock();
-    const float targetEye = link->eyePos.y - link->current.pos.y;
+    const cXyz eyeRef = g_preIkEyeValid ? g_preIkEye : link->eyePos;
+    g_preIkEyeValid = false;
+    const float targetEye = eyeRef.y - link->current.pos.y;
     const s16 facing = link->shape_angle.y;
     const float targetFwd = std::clamp(
-        (link->eyePos.x - link->current.pos.x) * cM_ssin(facing) +
-            (link->eyePos.z - link->current.pos.z) * cM_scos(facing),
+        (eyeRef.x - link->current.pos.x) * cM_ssin(facing) +
+            (eyeRef.z - link->current.pos.z) * cM_scos(facing),
         0.f, link->checkWolf() ? 100.f : 25.f);
     const bool wolf = link->checkWolf();
     if (!g_linkValid || wolf != g_wasWolf) {
@@ -1091,6 +1111,83 @@ void finish_pose(J3DModel* model) {
     }
 }
 
+// Eye position in the head joint's frame (from the game's own eye computation).
+constexpr Vec3 kHumanLocalEye{12.f, -8.f, 0.f};
+constexpr Vec3 kWolfLocalEye{30.f, -5.f, 0.f};
+
+Vec3 mul_point(const Mtx m, const Vec3& v) {
+    return {m[0][0] * v.x + m[0][1] * v.y + m[0][2] * v.z + m[0][3],
+        m[1][0] * v.x + m[1][1] * v.y + m[1][2] * v.z + m[1][3],
+        m[2][0] * v.x + m[2][1] * v.y + m[2][2] * v.z + m[2][3]};
+}
+
+Quat mtx_rot(const Mtx m) {
+    return quat_from_axes({m[0][0], m[1][0], m[2][0]}, {m[0][1], m[1][1], m[2][1]},
+        {m[0][2], m[1][2], m[2][2]});
+}
+
+// Puts Link's head where the headset is, the way a VR avatar does: the spine and neck bend toward
+// it (so leaning leans the chest and shoulders) and twist with where you look, and the head takes
+// the headset's orientation. The hips and feet stay where they are.
+void solve_spine(daAlink_c* link, J3DModel* model, const Vec3& anchor) {
+    J3DModelData* data = model->getModelData();
+    const auto M = [&](int j) { return model->getAnmMtx(j); };
+    const Pose& hmd = xr::head();
+
+    // The head joint's rest orientation, relative to looking straight along Link's facing.
+    Mtx bindHead, restHead;
+    bind_matrix(data, kHeadJoint, bindHead);
+    MTXConcat(model->getBaseTRMtx(), bindHead, restHead);
+    const float facingYaw = yaw_from_game(link->shape_angle.y);
+    const Quat headFromView = Quat::yaw(facingYaw).conjugate() * mtx_rot(restHead);
+
+    const Quat view = Quat::yaw(g_yawOffset) * hmd.orientation;
+    const Quat targetRot = normalized(view * headFromView);
+    const Vec3 eye = tracking_to_world_fp(hmd.position, anchor);
+    const Vec3 targetPos = eye - targetRot.rotate(kHumanLocalEye);
+
+    // Lean: swing the upper body about the base of the spine toward the head target.
+    constexpr int kSpine[] = {1, 2, 3};  // backbone1, backbone2, neck
+    constexpr float kLean[] = {0.4f, 0.35f, 0.25f};
+    constexpr float kTwist[] = {0.2f, 0.3f, 0.3f};  // the head itself takes the rest
+    const Vec3 root = mtx_pos(M(kSpine[0]));
+    Quat lean = from_to(mtx_pos(M(kHeadJoint)) - root, targetPos - root);
+    const float leanAngle = 2.f * std::acos(std::fmin(1.f, std::fabs(lean.w)));
+    const float maxLean = deg2rad(55.f);
+    if (leanAngle > maxLean) {
+        lean = partial(lean, maxLean / leanAngle);
+    }
+    // Twist: look sideways and the shoulders follow part of the way.
+    const float twistAngle = std::clamp(
+        wrap_pi(yaw_of(view.rotate({0.f, 0.f, -1.f})) - facingYaw), deg2rad(-70.f), deg2rad(70.f));
+    const Quat twist = Quat::yaw(twistAngle);
+
+    std::vector<u16> joints;
+    for (int i = 0; i < 3; ++i) {
+        const Vec3 pivot = mtx_pos(M(kSpine[i]));
+        const Quat q = normalized(partial(lean, kLean[i]) * partial(twist, kTwist[i]));
+        collect_subtree(data, kSpine[i], joints);
+        for (u16 j : joints) {
+            rotate_about(M(j), q, pivot, {});
+        }
+    }
+    // The head looks exactly where you look.
+    const Quat delta = normalized(targetRot * mtx_rot(M(kHeadJoint)).conjugate());
+    const Vec3 headPos = mtx_pos(M(kHeadJoint));
+    collect_subtree(data, kHeadJoint, joints);
+    for (u16 j : joints) {
+        rotate_about(M(j), delta, headPos, {});
+    }
+
+    // Debug aid: DUSK_VR_DEBUG_IK=1 logs how far the posed eyes land from the camera.
+    static int counter = 0;
+    if (std::getenv("DUSK_VR_DEBUG_IK") != nullptr && counter++ % 60 == 0) {
+        const Vec3 posedEye = mul_point(M(kHeadJoint), kHumanLocalEye);
+        Log.info("spine IK: eye error {:.1f} units, lean {:.0f} deg, twist {:.0f} deg",
+            (posedEye - eye).length(), leanAngle * 180.f / kPi, twistAngle * 180.f / kPi);
+    }
+}
+
 void restore_item_joints(daAlink_c* link) {
     if (g_itemsSwapped && !link->checkWolf()) {
         link->mLeftItemJntNo = kLeftArm.weapon;
@@ -1109,6 +1206,19 @@ void override_link_hands(daAlink_c* link) {
         return;
     }
     bool posed = getSettings().vr.fullBody && steady_body(link, model);
+
+    // Where the eyes are before the head follows the headset (the camera anchors here).
+    const Vec3 eyeLocal = link->checkWolf() ? kWolfLocalEye : kHumanLocalEye;
+    const Vec3 preEye = mul_point(model->getAnmMtx(kHeadJoint), eyeLocal);
+    g_preIkEye = to_cxyz(preEye);
+    g_preIkEyeValid = true;
+
+    if (getSettings().vr.fullBody && !link->checkWolf() && xr::head_valid()) {
+        solve_spine(link, model,
+            first_person_anchor(link->current.pos, g_eyeHeightCurr, link->shape_angle.y, g_eyeFwdCurr));
+        posed = true;
+    }
+
     if (!getSettings().vr.motionControls || link->checkWolf()) {
         restore_item_joints(link);
         g_placements[xr::kLeft].valid = g_placements[xr::kRight].valid = false;

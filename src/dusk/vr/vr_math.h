@@ -62,6 +62,40 @@ inline Quat normalized(const Quat& q) {
     return l > 1e-6f ? Quat{q.x / l, q.y / l, q.z / l, q.w / l} : Quat{};
 }
 
+// Rotation of a 3x3 basis given as columns (x, y, z axes); scale in the columns is ignored.
+inline Quat quat_from_axes(Vec3 x, Vec3 y, Vec3 z) {
+    x = x.normalized();
+    y = y.normalized();
+    z = z.normalized();
+    const float trace = x.x + y.y + z.z;
+    Quat q;
+    if (trace > 0.f) {
+        const float s = std::sqrt(trace + 1.f) * 2.f;
+        q = {(y.z - z.y) / s, (z.x - x.z) / s, (x.y - y.x) / s, 0.25f * s};
+    } else if (x.x > y.y && x.x > z.z) {
+        const float s = std::sqrt(1.f + x.x - y.y - z.z) * 2.f;
+        q = {0.25f * s, (y.x + x.y) / s, (z.x + x.z) / s, (y.z - z.y) / s};
+    } else if (y.y > z.z) {
+        const float s = std::sqrt(1.f + y.y - x.x - z.z) * 2.f;
+        q = {(y.x + x.y) / s, 0.25f * s, (z.y + y.z) / s, (z.x - x.z) / s};
+    } else {
+        const float s = std::sqrt(1.f + z.z - x.x - y.y) * 2.f;
+        q = {(z.x + x.z) / s, (z.y + y.z) / s, 0.25f * s, (x.y - y.x) / s};
+    }
+    return normalized(q);
+}
+
+// A fraction of a rotation (0 = none, 1 = all of it), about the same axis.
+inline Quat partial(const Quat& q, float t) {
+    Quat r = q.w < 0.f ? Quat{-q.x, -q.y, -q.z, -q.w} : q;
+    const float angle = 2.f * std::acos(std::fmin(1.f, r.w));
+    const float s = std::sqrt(std::fmax(0.f, 1.f - r.w * r.w));
+    if (s < 1e-5f) {
+        return {};
+    }
+    return Quat::axisAngle({r.x / s, r.y / s, r.z / s}, angle * t);
+}
+
 // Shortest rotation taking direction a onto direction b.
 inline Quat from_to(const Vec3& a, const Vec3& b) {
     const Vec3 u = a.normalized();
